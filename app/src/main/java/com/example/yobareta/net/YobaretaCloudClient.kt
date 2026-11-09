@@ -4,6 +4,9 @@ import android.util.Base64
 import android.util.Log
 import com.example.yobareta.AppConfig
 import com.example.yobareta.auth.AuthManager
+import com.example.yobareta.model.DailyPatientEntry
+import com.example.yobareta.model.MatchedPatientSummary
+import com.example.yobareta.model.NurseAnnounceResult
 import com.example.yobareta.model.RecognizeAlertResult
 import com.example.yobareta.model.UserWatchProfile
 import kotlinx.coroutines.Dispatchers
@@ -116,6 +119,145 @@ class YobaretaCloudClient(
                 destination = json.optString("destination", ""),
                 instructionPlain = json.optString("instruction_plain", ""),
                 latencyMs = json.optInt("latency_ms", 0)
+            )
+        }
+    }
+
+    /**
+     * Sends spoken announcement from the nurse station tablet microphone to Cloud Run.
+     * Cloud Run transcribes with STT chirp_3 and pushes real-time WebSocket alerts to matched patients.
+     */
+    suspend fun announceAudio(
+        pcm16LeBytes: ByteArray,
+        baseUrlOverride: String = ""
+    ): NurseAnnounceResult = withContext(Dispatchers.IO) {
+        val baseUrl = resolveBaseUrl(baseUrlOverride)
+        val audioB64 = Base64.encodeToString(pcm16LeBytes, Base64.NO_WRAP)
+        val bodyJson = JSONObject().apply {
+            put("audio_b64", audioB64)
+        }
+
+        val reqBuilder = Request.Builder()
+            .url("$baseUrl/api/nurse/announce")
+            .post(bodyJson.toString().toRequestBody(JSON_MEDIA_TYPE))
+        if (AppConfig.API_SECRET.isNotEmpty()) {
+            reqBuilder.addHeader("X-Yobareta-Secret", AppConfig.API_SECRET)
+        }
+
+        httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+            val rawBody = resp.body?.string() ?: "{}"
+            if (!resp.isSuccessful) {
+                throw IllegalStateException("Cloud Run /api/nurse/announce HTTP ${resp.code}: $rawBody")
+            }
+            val json = JSONObject(rawBody)
+            val summaries = mutableListOf<MatchedPatientSummary>()
+            val arr = json.optJSONArray("matches")
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val m = arr.getJSONObject(i)
+                    summaries.add(
+                        MatchedPatientSummary(
+                            sessionId = m.optString("session_id", ""),
+                            name = m.optString("name", ""),
+                            ticket = m.optString("ticket", ""),
+                            tier = m.optString("tier", "called"),
+                            destination = m.optString("destination", ""),
+                            instruction = m.optString("instruction", "")
+                        )
+                    )
+                }
+            }
+            NurseAnnounceResult(
+                transcript = json.optString("transcript", ""),
+                matchesCount = json.optInt("matches_count", 0),
+                matchedSummaries = summaries
+            )
+        }
+    }
+
+    suspend fun registerPatientInCloud(
+        entry: DailyPatientEntry,
+        baseUrlOverride: String = ""
+    ): Boolean = withContext(Dispatchers.IO) {
+        val baseUrl = resolveBaseUrl(baseUrlOverride)
+        val bodyJson = JSONObject().apply {
+            put("name", entry.name)
+            put("ticket_number", entry.ticketNumber)
+            put("full_name_readings", JSONArray(entry.fullReadings))
+            put("surname_readings", JSONArray(entry.surnameReadings))
+            put("given_name_readings", JSONArray(entry.givenReadings))
+            put("venue_mode", "auto")
+        }
+
+        val reqBuilder = Request.Builder()
+            .url("$baseUrl/api/patient/checkin")
+            .post(bodyJson.toString().toRequestBody(JSON_MEDIA_TYPE))
+        if (AppConfig.API_SECRET.isNotEmpty()) {
+            reqBuilder.addHeader("X-Yobareta-Secret", AppConfig.API_SECRET)
+        }
+
+        httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+            resp.isSuccessful
+        }
+    }
+
+    suspend fun removePatientFromCloud(
+        sessionId: String,
+        baseUrlOverride: String = ""
+    ): Boolean = withContext(Dispatchers.IO) {
+        val baseUrl = resolveBaseUrl(baseUrlOverride)
+        val reqBuilder = Request.Builder()
+            .url("$baseUrl/api/patient/$sessionId")
+            .delete()
+        if (AppConfig.API_SECRET.isNotEmpty()) {
+            reqBuilder.addHeader("X-Yobareta-Secret", AppConfig.API_SECRET)
+        }
+
+        httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+            resp.isSuccessful
+        }
+    }
+
+    suspend fun simulateCall(
+        transcript: String,
+        baseUrlOverride: String = ""
+    ): NurseAnnounceResult = withContext(Dispatchers.IO) {
+        val baseUrl = resolveBaseUrl(baseUrlOverride)
+        val bodyJson = JSONObject().apply {
+            put("transcript", transcript)
+        }
+
+        val reqBuilder = Request.Builder()
+            .url("$baseUrl/api/nurse/simulate")
+            .post(bodyJson.toString().toRequestBody(JSON_MEDIA_TYPE))
+        if (AppConfig.API_SECRET.isNotEmpty()) {
+            reqBuilder.addHeader("X-Yobareta-Secret", AppConfig.API_SECRET)
+        }
+
+        httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+            val rawBody = resp.body?.string() ?: "{}"
+            val json = JSONObject(rawBody)
+            val summaries = mutableListOf<MatchedPatientSummary>()
+            val arr = json.optJSONArray("matches")
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val m = arr.getJSONObject(i)
+                    summaries.add(
+                        MatchedPatientSummary(
+                            sessionId = m.optString("session_id", ""),
+                            name = m.optString("name", ""),
+                            ticket = m.optString("ticket", ""),
+                            tier = m.optString("tier", "called"),
+                            destination = m.optString("destination", ""),
+                            instruction = m.optString("instruction", "")
+                        )
+                    )
+                }
+            }
+            NurseAnnounceResult(
+                transcript = json.optString("transcript", ""),
+                matchesCount = json.optInt("matches_count", 0),
+                matchedSummaries = summaries
             )
         }
     }

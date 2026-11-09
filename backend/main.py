@@ -24,11 +24,13 @@ import os
 import time
 from typing import Dict, List, Optional
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect, status
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from auth_verify import ensure_firebase_initialized, verify_request_tokens
 from matcher import evaluate_transcript, get_reading_extractor
+from patient_hub import get_patient_hub, PatientSession
 from stage2_gemini import get_stage2_verifier, merge_stage1_and_stage2
 from stt_client import get_stt_recognizer
 
@@ -126,6 +128,19 @@ class RecognizeJsonRequest(BaseModel):
     )
     full_name_threshold: float = Field(default=0.85, ge=0.5, le=1.0)
     surname_threshold: float = Field(default=0.90, ge=0.5, le=1.0)
+
+
+class PatientCheckinRequest(BaseModel):
+    name: str = Field(description="Patient display/kanji/English name")
+    ticket_number: str = Field(default="", description="Waiting ticket or order number")
+    full_name_readings: List[str] = Field(default_factory=list)
+    surname_readings: List[str] = Field(default_factory=list)
+    given_name_readings: List[str] = Field(default_factory=list)
+    venue_mode: str = Field(default="auto")
+
+
+class NurseSimulateRequest(BaseModel):
+    transcript: str = Field(description="Simulated nurse announcement text")
 
 
 class RecognizeResponse(BaseModel):
@@ -376,3 +391,150 @@ async def recognize(
         instruction_plain=final_result.instruction_plain,
         latency_ms=total_latency_ms,
     )
+
+# ==============================================================================
+# Patient Queue & Nurse Desk Real-time PWA Endpoints
+# ==============================================================================
+
+@app.post("/api/patient/checkin")
+async def patient_checkin(req: PatientCheckinRequest) -> dict:
+    """Registers a patient who scanned the QR code into the live queue."""
+    hub = get_patient_hub()
+    session = await hub.register_patient(
+        name=req.name,
+        ticket_number=req.ticket_number,
+        full_name_readings=req.full_name_readings,
+        surname_readings=req.surname_readings,
+        given_name_readings=req.given_name_readings,
+        venue_mode=req.venue_mode,
+    )
+    return session.to_summary()
+
+
+@app.get("/api/patient/{session_id}")
+async def get_patient_status(session_id: str) -> dict:
+    """Returns current wait status and call destination for a patient."""
+    hub = get_patient_hub()
+    session = await hub.get_patient(session_id)
+    if not session:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+    return session.to_summary()
+
+
+@app.delete("/api/patient/{session_id}")
+async def leave_queue(session_id: str) -> dict:
+    """Removes a patient from the queue when they leave or check out."""
+    hub = get_patient_hub()
+    removed = await hub.remove_patient(session_id)
+    return {"status": "ok", "removed": removed}
+
+
+@app.get("/api/queue")
+async def get_active_queue() -> List[dict]:
+    """Returns the live active queue for the nurse station dashboard."""
+    hub = get_patient_hub()
+    return await hub.get_active_queue()
+
+
+@app.websocket("/ws/patient/{session_id}")
+async def patient_websocket(websocket: WebSocket, session_id: str):
+    """Real-time push channel to deliver vibrations and alerts to patient mobile PWA."""
+    hub = get_patient_hub()
+    await websocket.accept()
+    session = await hub.attach_websocket(session_id, websocket)
+    if not session:
+        await websocket.close(code=1008, reason="Session not found")
+        return
+
+    logger.info("WebSocket connected for patient session: %s", session_id)
+    try:
+        while True:
+            msg = await websocket.receive_text()
+            if msg == "ping":
+                await websocket.send_text("pong")
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected for session: %s", session_id)
+    except Exception as exc:
+        logger.warning("WebSocket error for session %s: %s", session_id, exc)
+    finally:
+        await hub.detach_websocket(session_id)
+
+
+@app.post("/api/nurse/simulate")
+async def nurse_simulate(req: NurseSimulateRequest) -> dict:
+    """Simulates an announcement text, matching against all waiting patients."""
+    hub = get_patient_hub()
+    matches = await hub.match_announcement(req.transcript)
+    matched_summaries = []
+    for patient, match in matches:
+        await hub.notify_and_update(patient, match)
+        matched_summaries.append({
+            "session_id": patient.session_id,
+            "name": patient.name,
+            "ticket": patient.ticket_number,
+            "tier": match.tier,
+            "destination": match.destination,
+            "instruction": match.instruction_plain,
+        })
+    return {
+        "transcript": req.transcript,
+        "matches_count": len(matches),
+        "matches": matched_summaries,
+    }
+
+
+@app.post("/api/nurse/announce")
+async def nurse_announce(
+    request: Request,
+    audio: Optional[UploadFile] = File(default=None),
+) -> dict:
+    """Accepts spoken announcement from nurse desk mic, transcribes with STT, and notifies matched patients."""
+    audio_bytes = b""
+    content_type = (request.headers.get("content-type") or "").lower()
+    if "multipart/form-data" in content_type:
+        if audio is not None:
+            audio_bytes = await audio.read()
+    else:
+        try:
+            body = await request.json()
+            if "audio_b64" in body:
+                audio_bytes = base64.b64decode(body["audio_b64"])
+        except Exception:
+            pass
+
+    if not audio_bytes:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing audio payload")
+
+    # Transcribe via Speech-to-Text V2 chirp_3
+    stt = get_stt_recognizer()
+    transcript = await asyncio.to_thread(
+        stt.recognize_pcm16,
+        audio_bytes,
+        [], [], None, None, "auto", "auto"
+    )
+
+    hub = get_patient_hub()
+    matches = await hub.match_announcement(transcript)
+    matched_summaries = []
+    for patient, match in matches:
+        await hub.notify_and_update(patient, match)
+        matched_summaries.append({
+            "session_id": patient.session_id,
+            "name": patient.name,
+            "ticket": patient.ticket_number,
+            "tier": match.tier,
+            "destination": match.destination,
+            "instruction": match.instruction_plain,
+        })
+
+    return {
+        "transcript": transcript,
+        "matches_count": len(matches),
+        "matches": matched_summaries,
+    }
+
+
+# Mount static files for PWA (index.html, nurse.html, manifest.json, sw.js, css, js)
+_STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+if os.path.exists(_STATIC_DIR):
+    app.mount("/", StaticFiles(directory=_STATIC_DIR, html=True), name="static")

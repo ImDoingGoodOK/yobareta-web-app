@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#0284c7">
+  <title>Yobareta - Nurse Station Desk Mic & Queue Management</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+  <!-- App Header -->
+  <header class="app-header">
+    <div class="brand">
+      <div class="brand-icon">🏥</div>
+      <div>
+        <div class="brand-title">Nurse Station Desk Console</div>
+        <div class="brand-sub">Yobareta Automated Queue Broadcaster</div>
+      </div>
+    </div>
+    <div id="micStatusBadge" class="status-badge">Idle</div>
+  </header>
+
+  <main class="container" style="max-width: 900px;">
+
+    <!-- Grid Layout: Left Column = Desk Mic, Right Column = Patient Check-in QR Code -->
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px;">
+
+      <!-- Card 1: Desk Mic Broadcaster -->
+      <div class="card">
+        <h2 class="card-title">🎙️ Nurse Station Microphone</h2>
+        <p class="card-desc">
+          Leave this microphone running at the reception or nurse desk. When staff announce a patient's name or number into the room, Yobareta will detect it, match the patient, and alert their phone instantly.
+        </p>
+
+        <button id="startMicBtn" class="btn btn-primary" type="button" style="margin-bottom: 14px;">
+          Start Desk Mic / 受付マイク開始
+        </button>
+
+        <div style="display: flex; justify-content: space-between; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 4px;">
+          <span>Live Audio Level (VAD)</span>
+          <span id="dbFsText">-60 dBFS</span>
+        </div>
+        <div class="vu-meter-bar">
+          <div id="vuFill" class="vu-meter-fill"></div>
+        </div>
+
+        <!-- Manual Simulation Test -->
+        <div style="margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border);">
+          <label class="form-label" style="font-size: 0.8rem;">Manual Call Announcement (Test)</label>
+          <div style="display: flex; gap: 8px;">
+            <input type="text" id="simText" class="form-input" style="padding: 8px 12px; font-size: 0.88rem;" value="東海林太郎様、3番診察室へお入りください">
+            <button id="simBtn" class="btn btn-secondary" type="button" style="width: auto; padding: 8px 16px; white-space: nowrap;">
+              Call / 呼出
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Card 2: Patient Check-in QR Code -->
+      <div class="card" style="text-align: center;">
+        <h2 class="card-title">📲 Patient Check-in QR Code</h2>
+        <p class="card-desc">
+          Display on counter tablet or print out. Patients scan this to join the queue on their phone.
+        </p>
+
+        <div style="display: flex; justify-content: center; margin: 12px 0;">
+          <img id="qrCanvas" alt="Check-in QR Code" width="200" height="200" style="border-radius: 8px; border: 1px solid var(--border); padding: 8px; background: #fff;">
+        </div>
+
+        <p style="font-size: 0.8rem; color: var(--text-muted);">
+          URL: <a id="qrLink" href="/" target="_blank" style="color: var(--primary);">/</a>
+        </p>
+      </div>
+
+    </div>
+
+    <!-- Active Patients Live Queue Table -->
+    <div class="card">
+      <h2 class="card-title">📋 Active Waiting Queue / 待合中患者一覧</h2>
+      <p class="card-desc">
+        Patients currently registered and monitoring for announcements.
+      </p>
+
+      <div style="overflow-x: auto;">
+        <table class="queue-table">
+          <thead>
+            <tr>
+              <th>Ticket #</th>
+              <th>Name</th>
+              <th>Wait Time</th>
+              <th>Status</th>
+              <th>Destination</th>
+            </tr>
+          </thead>
+          <tbody id="queueTbody">
+            <tr>
+              <td colspan="5" style="text-align:center;color:var(--text-muted);">No patients currently in queue.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Announcement Transcript Log -->
+    <div class="card">
+      <h2 class="card-title">📜 Recognition Event Log</h2>
+      <div id="transcriptLog" style="max-height: 180px; overflow-y: auto; font-family: monospace; font-size: 0.82rem; color: var(--text-muted);">
+        <p>Awaiting first nurse announcement...</p>
+      </div>
+    </div>
+
+  </main>
+
+  <script src="/js/nurse.js"></script>
+</body>
+</html>

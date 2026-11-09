@@ -31,6 +31,7 @@ import com.example.yobareta.audio.OnDeviceAudioGate
 import com.example.yobareta.model.RecognizeAlertResult
 import com.example.yobareta.model.UserWatchProfile
 import com.example.yobareta.net.YobaretaCloudClient
+import com.example.yobareta.queue.DailyQueueManager
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -56,6 +57,9 @@ data class ListenServiceUiState(
     val usingYamnetModel: Boolean = false,
     val percentAudioSent: Float = 0f,
     val segmentsUploadedCount: Int = 0,
+    val latestTranscript: String = "",
+    val latestMatchesCount: Int = 0,
+    val latestMatchedInfo: String = "",
     val latestAlert: RecognizeAlertResult? = null,
     val hasReplayable10sClip: Boolean = false,
     val isReplayingAudio: Boolean = false,
@@ -80,6 +84,8 @@ class ListenService : Service() {
 
         @Volatile
         var activeProfile: UserWatchProfile = UserWatchProfile()
+        @Volatile
+        var queueManager: DailyQueueManager? = null
 
         @Volatile
         private var last10sReplaySnapshot: ShortArray = ShortArray(0)
@@ -271,6 +277,33 @@ class ListenService : Service() {
                 it.copy(segmentsUploadedCount = it.segmentsUploadedCount + 1)
             }
             try {
+                val qm = queueManager
+                if (qm != null) {
+                    try {
+                        val announceRes = cloudClient.announceAudio(pcmBytes)
+                        val matchedInfo = announceRes.matchedSummaries.firstOrNull()?.let { m ->
+                            "#${m.ticket} ${m.name} (${m.destination})"
+                        } ?: if (announceRes.transcript.isNotEmpty()) "Recognized: \"${announceRes.transcript}\"" else ""
+
+                        _uiState.update {
+                            it.copy(
+                                latestTranscript = announceRes.transcript,
+                                latestMatchesCount = announceRes.matchesCount,
+                                latestMatchedInfo = matchedInfo,
+                                lastError = null
+                            )
+                        }
+
+                        if (announceRes.matchesCount > 0) {
+                            announceRes.matchedSummaries.forEach { m ->
+                                qm.markPatientCalledByMatch(m.ticket.ifEmpty { m.name }, m.destination)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Nurse desk announce failed: ${e.message}")
+                    }
+                }
+
                 val result = cloudClient.recognizeSegment(
                     pcm16LeBytes = pcmBytes,
                     profile = profileSnapshot,

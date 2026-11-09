@@ -1,83 +1,147 @@
-# Yobareta (呼ばれた)
+# Yobareta (呼ばれた) — Live Queue Audio Assistance System
 
-## Never miss your turn. 
-### An assistive waiting-room call detector for Deaf, hard-of-hearing, and international individuals.
-
-📌 Overview
-
-Waiting rooms in hospitals, government offices, restaurants, and cafés can be an anxiety-inducing experience if you cannot hear PA announcements or struggle with language barriers.
-
-Yobareta listens in the background for your specific name or ticket number and instantly alerts your phone with an actionable, glanceable prompt:
-
-"You were called → Exam Room 3"
-
-Built for DevFest Hackathon 2026.
+> **Never miss your turn.**  
+> An assistive waiting-room call detector for Deaf, hard-of-hearing, and international individuals.  
+> Built for **DevFest Hackathon 2026** (Team `df-2026-t044`).
 
 ---
 
-DevFest Hackathon 2026 Submission Repository
-This is the final submission repository for your DevFest Hackathon 2026 team. Please ensure that your project code and documentation are uploaded to this repository by the submission deadline.
+## 📌 Executive Overview
 
-This repository is public. It will be visible to the organizers, judges, and other participants throughout the event.
+Waiting rooms in hospitals, outpatient clinics, municipal ward offices (区役所・市役所), immigration centers, and crowded dining establishments are high-friction environments. For Deaf, hard-of-hearing, and elderly individuals (affecting **33.6% of seniors aged 75+ in Japan**, 84.4% of whom do not use hearing aids), anxiety over missing a scratchy PA call forces them to remain tethered to uncomfortable waiting chairs for hours.
 
-Getting Started
-Please accept the invitation sent via GitHub (the invitation expires in 7 days).
-Clone this repository and add your submission files.
-If the invitation expires or your team composition changes, please contact the organizers.
+**Yobareta** solves this bottleneck through a **Desk-Mic + Patient QR Code Progressive Web App (PWA)** architecture:
+1. **Dedicated Nurse-Station Microphone (`/nurse.html`):** A single stationary boundary USB microphone at the reception or nurse's desk captures spoken call announcements (e.g. `「〇〇様、3番診察室へお入りください」` or `"Mr. Alex Smith, please proceed to Exam Room 3"`).
+2. **Zero-Friction Patient PWA (`/index.html`):** Patients simply scan a QR code at check-in with any smartphone (iOS Safari / Android Chrome). **No app store download, no login, and zero battery drain.**
+3. **Zero Patient Device Audio Processing:** Patients need not grant microphone permissions. Announcements are transcribed centrally via Google Cloud Speech-to-Text V2 (`chirp_3`) and evaluated with our deterministic mora-matcher + Vertex AI Gemini 2.5 Flash disambiguation engine.
+4. **Instant Multi-Tier Haptic & Visual Alerts:** The patient’s device receives instant WebSocket push alerts, triggering glanceable haptic vibration (`navigator.vibrate`), dual-tone hospital chime audio, and high-visibility visual directions:
+   > **`You were called → Exam Room 3`**
+5. **Freedom of Movement:** Patients can freely wait in hospital cafeterias, outdoor gardens, or their personal vehicle without fear of missing their turn.
 
-Recommended: Use a Separate Repository for Development
-GitHub Actions and GitHub Pages are not available in this repository. If you wish to use CI, deployment, or GitHub Pages, please create a separate repository for your team's development work.
+---
 
-You may create this development repository under a team member's personal account or an organization created for your team.
-Conduct your development there, and push the final version of your code and documentation to this repository by the submission deadline.
-Evaluation will be based solely on the contents of this repository; any materials existing only in your development repository will not be considered.
-If your project is deployed, please include the URL in this README.
-Do Not Commit Sensitive Information
-Never commit API keys, passwords, service account keys, or similar sensitive data. As this is a public repository, any information pushed will be immediately visible to everyone. Be cautious when transferring files from your development repository; if you push the entire commit history, any sensitive information contained in past commits will also become public.
+## 🏛️ System Architecture
 
-Store sensitive information in files such as `.env` or `.dev.vars` and ensure they are not committed (they are already included in `.gitignore`).
-If you accidentally push sensitive information, immediately invalidate the affected keys, generate new ones, and notify the organizers. Simply deleting the data from the commit history is not sufficient.
-GitHub’s "push protection" feature may automatically block the pushing of data that resembles known key formats. If you are asked to stop, please remove that key from your commits.
-Submission
-Please follow the instructions provided by the organizers regarding the submission method and deadline. Once the submission deadline has passed, this repository will become read-only, and you will no longer be able to push changes.
-License
-The project is licensed under the MIT License. If you wish to use a different license, please modify the LICENSE file.
+```
+                      ┌────────────────────────────────────────┐
+                      │     Nurse Station / Reception Desk     │
+                      │  - Stationary USB Boundary Microphone  │
+                      │  - Web Audio VAD Slicer (/nurse.html)  │
+                      │  - Countertop Check-in QR Code Display │
+                      └──────────────────┬─────────────────────┘
+                                         │ 2–8s Audio Segment
+                                         ▼
+                      ┌────────────────────────────────────────┐
+                      │    Cloud Run Backend (asia-northeast1) │
+                      │  - FastAPI + WebSocket Session Hub     │
+                      │  - Cloud STT V2 chirp_3 (us-speech)    │
+                      │  - SudachiPy Mora & Phonetic Matcher   │
+                      │  - Vertex AI Gemini 2.5 Flash          │
+                      └──────────────────┬─────────────────────┘
+                                         │ WebSocket / Web Push
+                                         ▼
+                      ┌────────────────────────────────────────┐
+                      │       Patient Device (PWA - /)         │
+                      │  - Scanned via Check-in QR Code        │
+                      │  - Zero Mic / Zero Audio Processing    │
+                      │  - Haptics: navigator.vibrate()        │
+                      │  - Dual-Tone Chime (880 Hz → 587 Hz)   │
+                      │  - Fullscreen Glanceable Banner Alert  │
+                      └────────────────────────────────────────┘
+```
 
-# DevFest Hackathon 2026 提出用リポジトリ
+---
 
-  DevFest Hackathon 2026 のチームの **最終提出用** リポジトリです。提出期限までに、作品のコードと資料をこのリポジトリに置いてください。
+## 💼 B2B Business Model & Unit Economics
 
-  このリポジトリは **公開（public）** です。開催中も、運営・審査員・ほかの参加者が見られます。
+By decoupling speech recognition to a single desk microphone per venue, **cloud AI costs scale with the number of announcements rather than the number of waiting patients**.
 
-  ## はじめに
+- **Cost per 3-second speech clip:** ~¥0.13 to ¥0.50 JPY
+- **Monthly Cloud COGS (Multi-Doctor Clinic):** ~¥468 / month
+- **Gross Profit Margins:** **65% to 91%**
 
-  1. GitHub から届いた招待を受け入れてください（招待の期限は 7 日です）
-  2. このリポジトリを clone して、提出物を置いてください
+### Tiered B2B SaaS Monthly Pricing
 
-  招待の期限が切れたときや、メンバーが変わったときは、運営に連絡してください。
+| Venue Tier | Target Market | Monthly Fee (JPY) | Cloud COGS (Est.) | Gross Margin |
+| :--- | :--- | :--- | :--- | :--- |
+| **Tier 1: Solo Clinic** | Dentists, dermatology, solo pediatrics (~30 pts/day) | **¥1,500 / mo** | ~¥137 | ~91% |
+| **Tier 2: Multi-Doctor Clinic** | Outpatient clinics, internal medicine (~100 pts/day) | **¥5,000 / mo** | ~¥468 | ~90% |
+| **Tier 3: Regional Hospital** | General hospitals, university medical centers (~600 pts/day) | **¥30,000 / mo** | ~¥2,730 | ~91% |
+| **Public: Ward Office (区役所)** | Municipal registration, health insurance counters | **¥16,000 / mo** | ~¥1,872 | ~88% |
+| **Hospitality: Dining / Café** | High-turnover casual restaurants & station counter cafés | **¥500 – ¥2,500 / mo** | ~¥117 – ¥936 | ~63% – 77% |
 
-  ## 開発用のリポジトリは別に作ることをおすすめします
+👉 *For the complete pricing schedule, market research on queue times in Japan, and economic cost analysis, see [**`docs/BUSINESS_MODEL.md`**](docs/BUSINESS_MODEL.md).*
 
-  このリポジトリでは **GitHub Actions と GitHub Pages が使えません**。CI やデプロイ、Pages での公開をしたいときは、チームで開発用のリポジトリを別に作ってください。
+---
 
-  - 開発用のリポジトリは、チームのメンバーのアカウントや、チームで作った Organization に作ってください
-  - 開発はそちらで進めて、提出期限までに最終版のコードと資料をこのリポジトリに push してください
-  - 審査はこのリポジトリの内容で行います。開発用のリポジトリにしかないものは、審査の対象になりません
-  - デプロイした作品の URL があれば、この README に書いてください
+## ⚖️ Legal & Regulatory Compliance (Japan)
 
-  ## 秘密情報をコミットしない
+- **PMD Act Safe (薬機法非該当):** Yobareta is an administrative queue notification and communication assistance system. It performs no clinical diagnosis, treatment planning, or patient monitoring, qualifying for full exemption from Program Medical Device (SaMD) certification.
+- **APPI (個人情報保護法):** Raw audio and unmasked transcripts are processed ephemerally in RAM and **never logged or written to disk**. Bystander names in background transcripts are automatically masked (e.g. `[***]様`).
+- **Copyright & IP Usage:** All open-source components, models, and synthetic evaluation audio assets conform to their respective licenses. See [**`docs/COPYRIGHT_DECLARATION.md`**](docs/COPYRIGHT_DECLARATION.md).
 
-  API キー・パスワード・サービスアカウントの鍵などは、**絶対にコミットしないでください**。公開リポジトリなので、push
-  した時点で誰でも見られます。開発用のリポジトリから持ってくるときも、履歴ごと push すると、過去のコミットに含まれる秘密情報も公開されます。
+---
 
-  - 秘密情報は `.env` や `.dev.vars` などに書き、コミットしない（`.gitignore` に入れてあります）
-  - 誤って push したら、すぐにキー（鍵）を無効にして作り直し、運営に連絡してください。履歴から消すだけでは不十分です
-  - GitHub の push protection が、よく知られた形式のキーの push を止めることがあります。止められたら、そのキーをコミットから外してください
+## 📂 Repository Structure
 
-  ## 提出
+```
+.
+├── backend/                        # Stateless Python FastAPI Cloud Run Backend
+│   ├── static/                     # PWA Web Client & Nurse Station Console
+│   │   ├── index.html              # Mobile PWA Check-In & Real-time Alert Screen
+│   │   ├── nurse.html              # Nurse Station Web Mic, Audio VAD & Queue Dashboard
+│   │   ├── manifest.json           # PWA Manifest (Add to Home Screen)
+│   │   ├── sw.js                   # Service Worker (Offline Cache & Web Push)
+│   │   ├── css/style.css           # High-Contrast Accessible Stylesheet
+│   │   └── js/
+│   │       ├── patient.js          # WebSocket client, haptics & audio chime
+│   │       └── nurse.js            # Web Audio API VAD, WAV encoder & QR generator
+│   ├── patient_hub.py              # In-RAM real-time patient queue & WebSocket dispatcher
+│   ├── main.py                     # API routes (/api/patient, /api/nurse, /recognize)
+│   ├── matcher.py                  # SudachiPy Japanese mora & Latin phonetic matcher
+│   ├── stage2_gemini.py            # Vertex AI Gemini 2.5 Flash disambiguation engine
+│   ├── stt_client.py               # Cloud Speech-to-Text V2 chirp_3 client
+│   └── tests/                      # Automated unit tests for name & ticket matching
+├── docs/
+│   ├── BUSINESS_MODEL.md           # B2B Tiered SaaS Pricing & Japan Queue Market Research
+│   └── COPYRIGHT_DECLARATION.md    # Formal Copyright & IP Usage Declaration Form
+├── eval/                           # Evaluation & Benchmark Suite
+│   ├── Yobareta_Eval_Colab.ipynb   # Interactive Google Colab Evaluation Notebook
+│   ├── calls.csv                   # 26 benchmark waiting-room audio test cases
+│   ├── generate_audio.py           # Synthetic audio clip generator (gTTS + ffmpeg)
+│   ├── score.py                    # Benchmark scoring & metrics evaluator
+│   └── test_audio_e2e.py           # End-to-end audio recognition test harness
+└── app/                            # Optional Native Android Client (Kotlin + Jetpack Compose)
+```
 
-  提出の方法と締切は、運営からの案内に従ってください。提出期限を過ぎると、このリポジトリは読み取り専用になり、push できなくなります。
+---
 
-  ## ライセンス
+## 🚀 Quickstart & Testing
 
-  [MIT License](LICENSE) です。ほかのライセンスにしたいときは、LICENSE を書き換えてください。
+### 1. Test the Web Application Locally
+
+```bash
+cd backend
+pip install -r requirements.txt
+uvicorn main:app --host 0.0.0.0 --port 8080 --reload
+```
+
+1. Open **Patient Check-in PWA:** `http://localhost:8080/`
+2. Open **Nurse Station Console:** `http://localhost:8080/nurse.html`
+3. On the Nurse Console, click **Call / 呼出** or speak into the microphone:
+   > `「東海林太郎様、3番診察室へお入りください」`
+4. The patient's browser vibrates, plays a dual-tone hospital chime, and flashes:
+   > **`You were called → Exam Room 3`**
+
+### 2. Run the Benchmark Evaluation
+
+```bash
+# Verify the deterministic matcher against all 26 benchmark test cases:
+python3 eval/score.py --verify-matcher
+```
+
+---
+
+## 📄 License
+
+This project is licensed under the [MIT License](LICENSE).

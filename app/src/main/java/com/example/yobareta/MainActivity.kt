@@ -9,17 +9,14 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.animateColor
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -30,26 +27,45 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.example.yobareta.auth.AuthManager
-import com.example.yobareta.model.RecognizeAlertResult
-import com.example.yobareta.model.UserWatchProfile
+import com.example.yobareta.model.DailyPatientEntry
+import com.example.yobareta.model.PatientQueueStatus
+import com.example.yobareta.net.YobaretaCloudClient
+import com.example.yobareta.qr.QrCodeBitmapGenerator
+import com.example.yobareta.queue.DailyQueueManager
 import com.example.yobareta.service.ListenService
 import com.example.yobareta.service.ListenServiceUiState
 import com.example.yobareta.setup.KanjiReadingProposer
 import com.example.yobareta.setup.ReadingOption
 import com.example.yobareta.ui.theme.YobaretaTheme
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import java.util.Locale
 
+/**
+ * Nurse Station & Reception Desk Tablet Console for Yobareta.
+ *
+ * Designed for cheap Android tablets placed at reception desks or nurse stations:
+ * - Continuously listens via USB / built-in microphone for spoken announcements.
+ * - Manages the daily waiting queue with automatic midnight reset.
+ * - Generates scannable QR codes for each patient to launch their zero-install PWA.
+ * - Displays live audio VU meter and push-alert delivery status.
+ */
 class MainActivity : ComponentActivity() {
 
     private val authManager by lazy { AuthManager() }
+    private val cloudClient by lazy { YobaretaCloudClient(authManager) }
+    private lateinit var queueManager: DailyQueueManager
+
+    private val micPermissionGranted = mutableStateOf(false)
 
     private val requestPermissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -58,56 +74,80 @@ class MainActivity : ComponentActivity() {
             isAudioPermissionGranted()
     }
 
-    private val micPermissionGranted = mutableStateOf(false)
-    private val authStatusText = mutableStateOf("Signing in anonymously...")
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         AppConfig.initFromContext(applicationContext)
         AuthManager.initAppCheck(applicationContext)
+        queueManager = DailyQueueManager(applicationContext, cloudClient)
+        ListenService.queueManager = queueManager
         micPermissionGranted.value = isAudioPermissionGranted()
 
         lifecycleScope.launch {
-            try {
-                val uid = authManager.ensureAuthenticated()
-                authStatusText.value = "Firebase Auth Active (${uid.take(8)}…)"
-            } catch (e: Exception) {
-                authStatusText.value = "Auth warning: ${e.localizedMessage}"
-            }
+            authManager.ensureAuthenticated()
         }
 
         setContent {
             YobaretaTheme {
                 val serviceState by ListenService.uiState.collectAsState()
                 val isMicGranted by micPermissionGranted
-                val authStatus by authStatusText
+                val queueList by queueManager.patients.collectAsState()
+                val currentDate by queueManager.currentDate.collectAsState()
+                val nextTicketNumber by queueManager.nextTicketNumber.collectAsState()
 
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    YobaretaAppScreen(
-                        authStatus = authStatus,
+                    NurseDeskTabletScreen(
                         isMicGranted = isMicGranted,
                         serviceState = serviceState,
+                        queueList = queueList,
+                        currentDate = currentDate,
+                        nextTicketNumber = nextTicketNumber,
                         onRequestPermissions = { requestAudioAndNotificationPermissions() },
-                        onStartListening = { profile ->
-                            ListenService.activeProfile = profile
-                            val intent = Intent(this, ListenService::class.java).apply {
-                                action = ListenService.ACTION_START
+                        onToggleListening = { start ->
+                            if (start) {
+                                val intent = Intent(this, ListenService::class.java).apply {
+                                    action = ListenService.ACTION_START
+                                }
+                                ContextCompat.startForegroundService(this, intent)
+                            } else {
+                                val intent = Intent(this, ListenService::class.java).apply {
+                                    action = ListenService.ACTION_STOP
+                                }
+                                startService(intent)
                             }
-                            ContextCompat.startForegroundService(this, intent)
                         },
-                        onStopListening = {
-                            val intent = Intent(this, ListenService::class.java).apply {
-                                action = ListenService.ACTION_STOP
+                        onAddPatient = { name, ticket, dest, fullR, surR, givR ->
+                            queueManager.addPatient(
+                                name = name,
+                                ticketInput = ticket,
+                                destination = dest,
+                                fullReadings = fullR,
+                                surnameReadings = surR,
+                                givenReadings = givR
+                            )
+                        },
+                        onMarkCompleted = { id -> queueManager.markPatientCompleted(id) },
+                        onRemovePatient = { id -> queueManager.removePatient(id) },
+                        onResetQueue = { startTicket -> queueManager.resetQueue(startTicket) },
+                        onSimulateCall = { text ->
+                            lifecycleScope.launch {
+                                try {
+                                    val res = cloudClient.simulateCall(text)
+                                    if (res.matchesCount > 0) {
+                                        res.matchedSummaries.forEach { m ->
+                                            queueManager.markPatientCalledByMatch(
+                                                m.ticket.ifEmpty { m.name },
+                                                m.destination
+                                            )
+                                        }
+                                    }
+                                } catch (_: Exception) {
+                                }
                             }
-                            startService(intent)
-                        },
-                        onDismissAlert = { ListenService.dismissAlert() },
-                        onReplay10s = { ListenService.replayLast10Seconds() },
-                        onForceSendClip = { ListenService.triggerSimulatedSegmentUpload() }
+                        }
                     )
                 }
             }
@@ -117,6 +157,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         micPermissionGranted.value = isAudioPermissionGranted()
+        queueManager.checkAndPerformDailyReset()
     }
 
     private fun isAudioPermissionGranted(): Boolean {
@@ -135,790 +176,861 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun YobaretaAppScreen(
-    authStatus: String,
+fun NurseDeskTabletScreen(
     isMicGranted: Boolean,
     serviceState: ListenServiceUiState,
+    queueList: List<DailyPatientEntry>,
+    currentDate: String,
+    nextTicketNumber: Int,
     onRequestPermissions: () -> Unit,
-    onStartListening: (UserWatchProfile) -> Unit,
-    onStopListening: () -> Unit,
-    onDismissAlert: () -> Unit,
-    onReplay10s: () -> Unit,
-    onForceSendClip: () -> Unit
+    onToggleListening: (Boolean) -> Unit,
+    onAddPatient: (String, String, String, List<String>, List<String>, List<String>) -> DailyPatientEntry,
+    onMarkCompleted: (String) -> Unit,
+    onRemovePatient: (String) -> Unit,
+    onResetQueue: (Int) -> Unit,
+    onSimulateCall: (String) -> Unit
 ) {
-    val scrollState = rememberScrollState()
+    val coroutineScope = rememberCoroutineScope()
+    val baseUrl = AppConfig.DEFAULT_CLOUD_RUN_BASE_URL
 
-    var kanjiName by remember { mutableStateOf("東海林 太郎") }
-    var selectedFullReading by remember { mutableStateOf("ショウジ タロウ") }
-    var selectedSurnameReading by remember { mutableStateOf("ショウジ") }
-    var selectedGivenReading by remember { mutableStateOf("タロウ") }
-    var proposedOptions by remember {
-        mutableStateOf(
-            listOf(
-                ReadingOption("ショウジ タロウ", "ショウジ", "一般的"),
-                ReadingOption("トウカイリン タロウ", "トウカイリン", "別読み"),
-                ReadingOption("SHOH-jee TAH-roh", "SHOH-jee", "Phonetic")
-            )
-        )
-    }
-    var showManualReadingEdit by remember { mutableStateOf(false) }
+    // Active modals
+    var activeQrPatient by remember { mutableStateOf<DailyPatientEntry?>(null) }
+    var showCounterStandQr by remember { mutableStateOf(false) }
+    var showResetConfirmDialog by remember { mutableStateOf(false) }
 
-    var ticketNumber by remember { mutableStateOf("305") }
-    var cloudRunUrl by remember { mutableStateOf(AppConfig.DEFAULT_CLOUD_RUN_BASE_URL) }
-    var showJudgeDrawer by remember { mutableStateOf(false) }
+    // Patient Form State
+    var nameInput by remember { mutableStateOf("") }
+    var ticketInput by remember { mutableStateOf("") }
+    var selectedDestination by remember { mutableStateOf("3番診察室 (Exam Room 3)") }
+    var customDestInput by remember { mutableStateOf("") }
+    var proposedReadings by remember { mutableStateOf<List<ReadingOption>>(emptyList()) }
+    var readingDebounceJob by remember { mutableStateOf<Job?>(null) }
 
-    fun buildCurrentProfile(): UserWatchProfile {
-        // Phonetic respellings ("AH-leks SMITH") are display-only; send only real-word hints.
-        val (fullHints, surnameHints) = KanjiReadingProposer.buildMatchHints(kanjiName, proposedOptions)
-        val primaryFull = if (KanjiReadingProposer.isPhoneticRespelling(selectedFullReading)) {
-            fullHints.firstOrNull().orEmpty()
-        } else {
-            selectedFullReading.trim()
-        }
-        val primarySurname = if (KanjiReadingProposer.isPhoneticRespelling(selectedSurnameReading)) {
-            surnameHints.firstOrNull().orEmpty()
-        } else {
-            selectedSurnameReading.trim()
-        }
-        val givenHints = KanjiReadingProposer.buildGivenNameHints(kanjiName, proposedOptions)
-        val primaryGiven = if (KanjiReadingProposer.isPhoneticRespelling(selectedGivenReading)) {
-            givenHints.firstOrNull().orEmpty()
-        } else {
-            selectedGivenReading.trim().ifEmpty { givenHints.firstOrNull().orEmpty() }
-        }
-        return UserWatchProfile(
-            kanjiName = kanjiName.trim(),
-            selectedFullReading = primaryFull,
-            selectedSurnameReading = primarySurname,
-            selectedGivenReading = primaryGiven,
-            alternateFullReadings = fullHints,
-            alternateSurnameReadings = surnameHints,
-            alternateGivenReadings = givenHints,
-            ticketNumber = ticketNumber.trim(),
-            venueMode = "auto",
-            languageMode = "auto",
-            cloudRunBaseUrl = cloudRunUrl.trim()
-        )
+    // Quick Simulation input
+    var simCallInput by remember { mutableStateOf("東海林太郎様、3番診察室へお入りください") }
+
+    // Queue Filter Tab
+    var selectedTab by remember { mutableStateOf(0) } // 0: All, 1: Waiting, 2: Called, 3: Completed
+
+    val waitingCount = queueList.count { it.status == PatientQueueStatus.WAITING }
+    val calledCount = queueList.count { it.status == PatientQueueStatus.CALLED || it.status == PatientQueueStatus.RECALL }
+    val completedCount = queueList.count { it.status == PatientQueueStatus.COMPLETED }
+
+    val filteredList = when (selectedTab) {
+        1 -> queueList.filter { it.status == PatientQueueStatus.WAITING }
+        2 -> queueList.filter { it.status == PatientQueueStatus.CALLED || it.status == PatientQueueStatus.RECALL }
+        3 -> queueList.filter { it.status == PatientQueueStatus.COMPLETED }
+        else -> queueList
     }
 
-    // Automatically enrich readings via Gemini after a brief typing pause
-    LaunchedEffect(kanjiName) {
-        val trimmed = kanjiName.trim()
+    // Auto-update readings as nurse types patient name
+    LaunchedEffect(nameInput) {
+        val trimmed = nameInput.trim()
         if (trimmed.isEmpty()) {
-            proposedOptions = emptyList()
-            selectedFullReading = ""
-            selectedSurnameReading = ""
+            proposedReadings = emptyList()
             return@LaunchedEffect
         }
-        kotlinx.coroutines.delay(450L)
-        val enriched = KanjiReadingProposer.proposeReadings(trimmed)
-        if (enriched.isNotEmpty()) {
-            proposedOptions = enriched
-            if (enriched.none { it.fullReading == selectedFullReading }) {
-                selectedFullReading = enriched.first().fullReading
-                selectedSurnameReading = enriched.first().surnameReading
-                val fClean = enriched.first().fullReading.replace("　", " ").trim()
-                val sClean = enriched.first().surnameReading.replace("　", " ").trim()
-                selectedGivenReading = fClean.replace(sClean, "").trim()
-            }
+        readingDebounceJob?.cancel()
+        readingDebounceJob = coroutineScope.launch {
+            delay(400)
+            proposedReadings = KanjiReadingProposer.proposeReadings(trimmed)
         }
     }
 
-    LaunchedEffect(kanjiName, selectedFullReading, selectedSurnameReading, selectedGivenReading, ticketNumber, cloudRunUrl) {
-        ListenService.activeProfile = buildCurrentProfile()
-    }
-
-    // Full-Screen Takeover when a full 'called' or 'recall' alert fires
-    val activeAlert = serviceState.latestAlert
-    if (activeAlert != null && (activeAlert.tier == "called" || activeAlert.tier == "recall")) {
-        FullScreenCallAlert(
-            alert = activeAlert,
-            hasReplayClip = serviceState.hasReplayable10sClip,
-            isReplaying = serviceState.isReplayingAudio,
-            onReplay10s = onReplay10s,
-            onDismiss = onDismissAlert
-        )
-        return
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(scrollState)
-            .padding(horizontal = 20.dp, vertical = 18.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        // 1. Minimalist App Header
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column {
-                Text(
-                    text = "Yobareta",
-                    style = MaterialTheme.typography.headlineMedium,
-                    fontWeight = FontWeight.ExtraBold
-                )
-                Text(
-                    text = "呼ばれた • Waiting Room Call Alert",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-
-            Surface(
-                shape = RoundedCornerShape(50),
-                color = if (serviceState.isListening) Color(0xFF1B5E20) else MaterialTheme.colorScheme.surfaceVariant
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(8.dp)
-                            .clip(CircleShape)
-                            .background(if (serviceState.isListening) Color(0xFF69F0AE) else Color.Gray)
-                    )
-                    Text(
-                        text = if (serviceState.isListening) "LISTENING" else "READY",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = if (serviceState.isListening) Color.White else MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-        }
-
-        // 2. Loud Network Drop Warning Banner ("Never fail silently")
-        if (!serviceState.isNetworkAvailable) {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFFB71C1C)),
-                shape = RoundedCornerShape(16.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text(
-                        text = "⚠️ NETWORK CONNECTION LOST",
-                        color = Color.White,
-                        fontWeight = FontWeight.ExtraBold,
-                        fontSize = 17.sp
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Cannot verify announcements while offline. Please reconnect Wi-Fi or mobile data.",
-                        color = Color.White.copy(alpha = 0.92f),
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                }
-            }
-        }
-
-        // 3. Subtle Amber Banner for Tier 1 'Possible' (Surname-Only Match)
-        if (activeAlert != null && activeAlert.tier == "possible") {
-            PossibleSurnameBanner(
-                alert = activeAlert,
-                hasReplayClip = serviceState.hasReplayable10sClip,
-                isReplaying = serviceState.isReplayingAudio,
-                onReplay10s = onReplay10s,
-                onDismiss = onDismissAlert
-            )
-        }
-
-        // 4. Hero Listening Status & Action Card
-        ListeningHeroCard(
-            isMicGranted = isMicGranted,
-            serviceState = serviceState,
-            kanjiName = kanjiName,
-            selectedFullReading = selectedFullReading,
-            ticketNumber = ticketNumber,
-            onRequestPermissions = onRequestPermissions,
-            onStartListening = { onStartListening(buildCurrentProfile()) },
-            onStopListening = onStopListening
-        )
-
-        // 5. Streamlined 2-Field Setup Card (Name + Ticket #)
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(18.dp),
-            elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-        ) {
-            Column(
-                modifier = Modifier.padding(18.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Text(
-                    text = "Who should we listen for?",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold
-                )
-
-                // Name Input (automatically updates readings as you type)
-                OutlinedTextField(
-                    value = kanjiName,
-                    onValueChange = { newName ->
-                        kanjiName = newName
-                        val instant = KanjiReadingProposer.proposeInstantLocalReadings(newName)
-                        proposedOptions = instant
-                        if (instant.isNotEmpty()) {
-                            selectedFullReading = instant.first().fullReading
-                            selectedSurnameReading = instant.first().surnameReading
-                            val fClean = instant.first().fullReading.replace("　", " ").trim()
-                            val sClean = instant.first().surnameReading.replace("　", " ").trim()
-                            selectedGivenReading = fClean.replace(sClean, "").trim()
-                        } else {
-                            selectedFullReading = ""
-                            selectedSurnameReading = ""
-                            selectedGivenReading = ""
-                        }
-                    },
-                    label = { Text("Your Name (漢字 / English)") },
-                    singleLine = true,
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth()
-                )
-
-                // Compact Horizontal Reading Pills
-                if (proposedOptions.isNotEmpty()) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        proposedOptions.forEach { option ->
-                            val isSelected = selectedFullReading == option.fullReading
-                            FilterChip(
-                                selected = isSelected,
-                                onClick = {
-                                    selectedFullReading = option.fullReading
-                                    selectedSurnameReading = option.surnameReading
-                                    val fClean = option.fullReading.replace("　", " ").trim()
-                                    val sClean = option.surnameReading.replace("　", " ").trim()
-                                    selectedGivenReading = fClean.replace(sClean, "").trim()
-                                },
-                                label = {
-                                    Text(
-                                        text = if (option.note.isNotEmpty()) {
-                                            "${option.fullReading} (${option.note})"
-                                        } else {
-                                            option.fullReading
-                                        },
-                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
-                                    )
-                                }
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text("🏥", fontSize = 24.sp)
+                        Column {
+                            Text(
+                                "Yobareta Nurse Desk (受付・ナースステーション)",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 18.sp
+                            )
+                            Text(
+                                "📅 $currentDate  |  待合: ${waitingCount}名 / 本日合計: ${queueList.size}名",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                     }
-                }
-
-                // Optional Manual Reading Toggle (hidden by default to keep UI clean)
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "Active: $selectedFullReading (Surname: $selectedSurnameReading, First: $selectedGivenReading)",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Text(
-                        text = if (showManualReadingEdit) "Done" else "Edit",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier
-                            .clickable { showManualReadingEdit = !showManualReadingEdit }
-                            .padding(4.dp)
-                    )
-                }
-
-                AnimatedVisibility(visible = showManualReadingEdit) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                },
+                actions = {
+                    Button(
+                        onClick = { showCounterStandQr = true },
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+                        modifier = Modifier.padding(end = 8.dp)
                     ) {
-                        OutlinedTextField(
-                            value = selectedFullReading,
-                            onValueChange = { selectedFullReading = it },
-                            label = { Text("Full Reading") },
-                            singleLine = true,
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.weight(1f)
-                        )
-                        OutlinedTextField(
-                            value = selectedSurnameReading,
-                            onValueChange = { selectedSurnameReading = it },
-                            label = { Text("Surname") },
-                            singleLine = true,
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.weight(0.75f)
-                        )
-                        OutlinedTextField(
-                            value = selectedGivenReading,
-                            onValueChange = { selectedGivenReading = it },
-                            label = { Text("First Name") },
-                            singleLine = true,
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.weight(0.75f)
-                        )
+                        Text("📲 受付スタンドQR", color = MaterialTheme.colorScheme.onPrimaryContainer, fontSize = 13.sp)
                     }
-                }
-
-                // Ticket / Order Number Input
-                OutlinedTextField(
-                    value = ticketNumber,
-                    onValueChange = { ticketNumber = it },
-                    label = { Text("Ticket / Order # (番号札 — Optional, e.g. 305)") },
-                    singleLine = true,
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth()
+                    OutlinedButton(
+                        onClick = { showResetConfirmDialog = true },
+                        modifier = Modifier.padding(end = 8.dp)
+                    ) {
+                        Text("🔄 本日リセット", fontSize = 13.sp)
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.surface
                 )
-            }
-        }
-
-        // 6. Collapsible Judge Telemetry & Developer Drawer
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(16.dp),
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
             )
+        }
+    ) { innerPadding ->
+        BoxWithConstraints(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f))
         ) {
-            Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+            val isTabletWide = maxWidth >= 760.dp
+
+            if (isTabletWide) {
+                // Two-column tablet layout
                 Row(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { showJudgeDrawer = !showJudgeDrawer }
-                        .padding(vertical = 4.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+                        .fillMaxSize()
+                        .padding(16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
-                    Text(
-                        text = "🔍 Judge Telemetry & Test Tools",
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.SemiBold,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Text(
-                        text = if (showJudgeDrawer) "Hide ▲" else "Show ▼",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                }
-
-                AnimatedVisibility(visible = showJudgeDrawer) {
+                    // Left Pane: Broadcaster & Check-in (42%)
                     Column(
-                        modifier = Modifier.padding(top = 12.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                        modifier = Modifier
+                            .weight(0.42f)
+                            .verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
-                        Text(
-                            text = String.format(
-                                Locale.US,
-                                "Gate: %s • Mic: %.1f dBFS (Ambient: %.1f dBFS)",
-                                if (serviceState.usingYamnetModel) "YAMNet + RMS" else "DSP VAD + RMS",
-                                serviceState.currentDbFs,
-                                serviceState.ambientBaselineDbFs
-                            ),
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                        Text(
-                            text = String.format(
-                                Locale.US,
-                                "Audio Sent to Cloud: %.1f%% (%d clips) • %s",
-                                serviceState.percentAudioSent,
-                                serviceState.segmentsUploadedCount,
-                                serviceState.warmStatus
-                            ),
-                            style = MaterialTheme.typography.bodySmall
+                        DeskMicBroadcasterCard(
+                            isMicGranted = isMicGranted,
+                            serviceState = serviceState,
+                            onRequestPermissions = onRequestPermissions,
+                            onToggleListening = onToggleListening,
+                            simCallInput = simCallInput,
+                            onSimCallInputChange = { simCallInput = it },
+                            onSimulateCall = onSimulateCall
                         )
 
-                        if (serviceState.isListening) {
-                            OutlinedButton(
-                                onClick = onForceSendClip,
-                                shape = RoundedCornerShape(10.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Text("Send Recent 3.5s Audio Segment Now")
+                        NewPatientCheckinCard(
+                            nextTicketNumber = nextTicketNumber,
+                            nameInput = nameInput,
+                            onNameInputChange = { nameInput = it },
+                            ticketInput = ticketInput,
+                            onTicketInputChange = { ticketInput = it },
+                            selectedDestination = selectedDestination,
+                            onDestinationChange = { selectedDestination = it },
+                            customDestInput = customDestInput,
+                            onCustomDestInputChange = { customDestInput = it },
+                            proposedReadings = proposedReadings,
+                            onRegisterPatient = {
+                                val fullReads = KanjiReadingProposer.buildFullNameHints(nameInput, proposedReadings)
+                                val surReads = KanjiReadingProposer.buildSurnameHints(nameInput, proposedReadings)
+                                val givReads = KanjiReadingProposer.buildGivenNameHints(nameInput, proposedReadings)
+                                val finalDest = if (selectedDestination == "Custom") customDestInput else selectedDestination
+
+                                val created = onAddPatient(
+                                    nameInput,
+                                    ticketInput.ifEmpty { nextTicketNumber.toString() },
+                                    finalDest,
+                                    fullReads,
+                                    surReads,
+                                    givReads
+                                )
+                                // Auto-show the QR code modal for this newly registered patient!
+                                activeQrPatient = created
+                                nameInput = ""
+                                ticketInput = ""
                             }
-                        }
-
-                        serviceState.lastError?.let { err ->
-                            Text(
-                                text = err,
-                                color = MaterialTheme.colorScheme.error,
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                        }
-
-                        OutlinedTextField(
-                            value = cloudRunUrl,
-                            onValueChange = { newUrl: String -> cloudRunUrl = newUrl },
-                            label = { Text("Cloud Run Base URL (asia-northeast1)") },
-                            singleLine = true,
-                            shape = RoundedCornerShape(10.dp),
-                            modifier = Modifier.fillMaxWidth()
                         )
-                        Text(
-                            text = authStatus,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                    }
+
+                    // Right Pane: Live Queue List (58%)
+                    Column(
+                        modifier = Modifier
+                            .weight(0.58f)
+                            .fillMaxHeight()
+                    ) {
+                        TodayQueueCard(
+                            selectedTab = selectedTab,
+                            onSelectTab = { selectedTab = it },
+                            totalCount = queueList.size,
+                            waitingCount = waitingCount,
+                            calledCount = calledCount,
+                            completedCount = completedCount,
+                            patients = filteredList,
+                            onShowQr = { activeQrPatient = it },
+                            onCallPatient = { p ->
+                                onSimulateCall("${p.name}様、${p.destination}へお入りください")
+                            },
+                            onMarkCompleted = onMarkCompleted,
+                            onRemovePatient = onRemovePatient
                         )
                     }
                 }
+            } else {
+                // Single-column smartphone / small portrait tablet fallback
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(12.dp)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    DeskMicBroadcasterCard(
+                        isMicGranted = isMicGranted,
+                        serviceState = serviceState,
+                        onRequestPermissions = onRequestPermissions,
+                        onToggleListening = onToggleListening,
+                        simCallInput = simCallInput,
+                        onSimCallInputChange = { simCallInput = it },
+                        onSimulateCall = onSimulateCall
+                    )
+
+                    NewPatientCheckinCard(
+                        nextTicketNumber = nextTicketNumber,
+                        nameInput = nameInput,
+                        onNameInputChange = { nameInput = it },
+                        ticketInput = ticketInput,
+                        onTicketInputChange = { ticketInput = it },
+                        selectedDestination = selectedDestination,
+                        onDestinationChange = { selectedDestination = it },
+                        customDestInput = customDestInput,
+                        onCustomDestInputChange = { customDestInput = it },
+                        proposedReadings = proposedReadings,
+                        onRegisterPatient = {
+                            val fullReads = KanjiReadingProposer.buildFullNameHints(nameInput, proposedReadings)
+                            val surReads = KanjiReadingProposer.buildSurnameHints(nameInput, proposedReadings)
+                            val givReads = KanjiReadingProposer.buildGivenNameHints(nameInput, proposedReadings)
+                            val finalDest = if (selectedDestination == "Custom") customDestInput else selectedDestination
+
+                            val created = onAddPatient(
+                                nameInput,
+                                ticketInput.ifEmpty { nextTicketNumber.toString() },
+                                finalDest,
+                                fullReads,
+                                surReads,
+                                givReads
+                            )
+                            activeQrPatient = created
+                            nameInput = ""
+                            ticketInput = ""
+                        }
+                    )
+
+                    TodayQueueCard(
+                        selectedTab = selectedTab,
+                        onSelectTab = { selectedTab = it },
+                        totalCount = queueList.size,
+                        waitingCount = waitingCount,
+                        calledCount = calledCount,
+                        completedCount = completedCount,
+                        patients = filteredList,
+                        onShowQr = { activeQrPatient = it },
+                        onCallPatient = { p ->
+                            onSimulateCall("${p.name}様、${p.destination}へお入りください")
+                        },
+                        onMarkCompleted = onMarkCompleted,
+                        onRemovePatient = onRemovePatient,
+                        modifier = Modifier.height(480.dp)
+                    )
+                }
             }
         }
+    }
+
+    // Modal 1: Individual Patient QR Code Dialog
+    activeQrPatient?.let { patient ->
+        PatientQrCodeDialog(
+            patient = patient,
+            baseUrl = baseUrl,
+            onDismiss = { activeQrPatient = null }
+        )
+    }
+
+    // Modal 2: Countertop Stand QR Code Dialog
+    if (showCounterStandQr) {
+        CounterStandQrDialog(
+            baseUrl = baseUrl,
+            onDismiss = { showCounterStandQr = false }
+        )
+    }
+
+    // Modal 3: Daily Reset Confirmation Dialog
+    if (showResetConfirmDialog) {
+        AlertDialog(
+            onDismissRequest = { showResetConfirmDialog = false },
+            title = { Text("本日の順番待ちをリセットしますか？") },
+            text = { Text("本日の登録患者リストをクリアし、受付番号を #101 から再開します。") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onResetQueue(DailyQueueManager.DEFAULT_START_TICKET)
+                        showResetConfirmDialog = false
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("リセット実行", color = MaterialTheme.colorScheme.onError)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showResetConfirmDialog = false }) {
+                    Text("キャンセル")
+                }
+            }
+        )
     }
 }
 
+// -----------------------------------------------------------------------------
+// Component: Desk Microphone Broadcaster Card
+// -----------------------------------------------------------------------------
+
 @Composable
-fun ListeningHeroCard(
+fun DeskMicBroadcasterCard(
     isMicGranted: Boolean,
     serviceState: ListenServiceUiState,
-    kanjiName: String,
-    selectedFullReading: String,
-    ticketNumber: String,
     onRequestPermissions: () -> Unit,
-    onStartListening: () -> Unit,
-    onStopListening: () -> Unit
+    onToggleListening: (Boolean) -> Unit,
+    simCallInput: String,
+    onSimCallInputChange: (String) -> Unit,
+    onSimulateCall: (String) -> Unit
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = if (serviceState.isListening) {
-                Color(0xFF0D3B2E)
-            } else {
-                MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.65f)
-            }
-        )
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
-        Column(
-            modifier = Modifier.padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
-        ) {
-            val targetSummary = buildString {
-                if (kanjiName.isNotBlank()) {
-                    append(kanjiName.trim())
-                    if (selectedFullReading.isNotBlank()) append(" ($selectedFullReading)")
-                }
-                if (ticketNumber.isNotBlank()) {
-                    if (isNotEmpty()) append("  •  ")
-                    append("#${ticketNumber.trim()}")
-                }
-            }.ifEmpty { "Enter your name or ticket number below" }
-
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 Text(
-                    text = if (serviceState.isListening) "Listening for your call…" else "Ready to listen for",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = if (serviceState.isListening) Color(0xFFA7F3D0) else MaterialTheme.colorScheme.onSecondaryContainer
-                )
-                Text(
-                    text = targetSummary,
-                    style = MaterialTheme.typography.titleMedium,
+                    "🎙️ 受付・呼出マイク (Desk Mic)",
                     fontWeight = FontWeight.Bold,
-                    color = if (serviceState.isListening) Color.White else MaterialTheme.colorScheme.onSecondaryContainer
+                    fontSize = 16.sp
                 )
-            }
-
-            if (serviceState.isListening) {
-                // Visual Audio Level Bar (normalized from [-65 dBFS .. -15 dBFS] to [0f .. 1f])
-                val normalizedLevel = ((serviceState.currentDbFs + 65f) / 50f).coerceIn(0.04f, 1f)
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    LinearProgressIndicator(
-                        progress = { normalizedLevel },
-                        color = if (serviceState.isCapturingSegment) Color(0xFF69F0AE) else Color(0xFF38BDF8),
-                        trackColor = Color.White.copy(alpha = 0.18f),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(8.dp)
-                            .clip(RoundedCornerShape(4.dp))
+                val badgeColor = if (serviceState.isListening) Color(0xFF16A34A) else Color(0xFF64748B)
+                val badgeText = if (serviceState.isListening) "稼働中 (Listening)" else "停止中 (Idle)"
+                Surface(
+                    shape = RoundedCornerShape(20.dp),
+                    color = badgeColor.copy(alpha = 0.15f)
+                ) {
+                    Text(
+                        badgeText,
+                        color = badgeColor,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                     )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            text = if (serviceState.isCapturingSegment) {
-                                "🟢 Speech detected — checking call…"
-                            } else {
-                                "🔒 Filtering background noise in RAM"
-                            },
-                            style = MaterialTheme.typography.labelSmall,
-                            color = Color.White.copy(alpha = 0.9f)
-                        )
-                        Text(
-                            text = String.format(
-                                Locale.US,
-                                "Only %.1f%% audio sent",
-                                serviceState.percentAudioSent
-                            ),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = Color(0xFFA7F3D0),
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
                 }
             }
+
+            Spacer(modifier = Modifier.height(12.dp))
 
             if (!isMicGranted) {
                 Button(
                     onClick = onRequestPermissions,
-                    shape = RoundedCornerShape(14.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(52.dp)
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                    modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("Grant Microphone & Notification Permissions", fontWeight = FontWeight.Bold)
+                    Text("マイク権限を許可してください")
                 }
             } else {
                 Button(
-                    onClick = if (serviceState.isListening) onStopListening else onStartListening,
+                    onClick = { onToggleListening(!serviceState.isListening) },
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (serviceState.isListening) Color(0xFFD32F2F) else Color(0xFF1565C0),
-                        contentColor = Color.White
+                        containerColor = if (serviceState.isListening) Color(0xFFDC2626) else MaterialTheme.colorScheme.primary
                     ),
-                    shape = RoundedCornerShape(14.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(54.dp)
+                    modifier = Modifier.fillMaxWidth()
                 ) {
                     Text(
-                        text = if (serviceState.isListening) "■ Stop Listening" else "▶ Start Listening",
-                        fontSize = 16.sp,
+                        if (serviceState.isListening) "マイクを停止する" else "受付マイクを開始する (常時集音)",
                         fontWeight = FontWeight.Bold
                     )
                 }
             }
-        }
-    }
-}
 
-@Composable
-fun PossibleSurnameBanner(
-    alert: RecognizeAlertResult,
-    hasReplayClip: Boolean,
-    isReplaying: Boolean,
-    onReplay10s: () -> Unit,
-    onDismiss: () -> Unit
-) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFFE65100))
-    ) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Text(
-                text = "🔔 POSSIBLE CALL — SURNAME MATCH (${alert.matchedTrigger})",
-                color = Color.White,
-                fontWeight = FontWeight.ExtraBold,
-                style = MaterialTheme.typography.labelLarge
-            )
-            Text(
-                text = alert.instructionPlain.ifEmpty { "Surname matched — check if this call is for you" },
-                color = Color.White,
-                fontWeight = FontWeight.Bold,
-                fontSize = 18.sp
-            )
-            if (alert.transcriptMasked.isNotEmpty()) {
-                Text(
-                    text = "「${alert.transcriptMasked}」",
-                    color = Color.White.copy(alpha = 0.9f),
-                    style = MaterialTheme.typography.bodySmall
-                )
-            }
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // VU Meter Level
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                if (hasReplayClip) {
-                    Button(
-                        onClick = onReplay10s,
-                        enabled = !isReplaying,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color.White,
-                            contentColor = Color.Black
-                        ),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text(if (isReplaying) "🔊 Replaying…" else "🔊 Replay 10s", fontWeight = FontWeight.Bold)
-                    }
-                }
-                OutlinedButton(
-                    onClick = onDismiss,
-                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text("Dismiss")
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun FullScreenCallAlert(
-    alert: RecognizeAlertResult,
-    hasReplayClip: Boolean,
-    isReplaying: Boolean,
-    onReplay10s: () -> Unit,
-    onDismiss: () -> Unit
-) {
-    val infiniteTransition = rememberInfiniteTransition(label = "fullScreenAlertFlash")
-    val isRecall = alert.tier == "recall"
-
-    val primaryColor = if (isRecall) Color(0xFFB71C1C) else Color(0xFF00695C)
-    val secondaryColor = if (isRecall) Color(0xFFE65100) else Color(0xFF2E7D32)
-
-    val animatedBg by infiniteTransition.animateColor(
-        initialValue = primaryColor,
-        targetValue = secondaryColor,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 550, easing = LinearEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "fullScreenBg"
-    )
-
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(animatedBg)
-            .padding(24.dp)
-    ) {
-        Column(
-            modifier = Modifier.fillMaxSize(),
-            verticalArrangement = Arrangement.SpaceBetween,
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            // Top Tier Badge
-            Surface(
-                shape = RoundedCornerShape(50),
-                color = Color.Black.copy(alpha = 0.28f),
-                modifier = Modifier.padding(top = 16.dp)
-            ) {
+                Text("音量レベル (VAD)", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text(
-                    text = if (isRecall) "🚨 URGENT RE-CALL • 再度お呼び出し" else "✅ YOU WERE CALLED • お呼び出し",
-                    color = Color.White,
-                    fontWeight = FontWeight.ExtraBold,
-                    fontSize = 15.sp,
-                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp)
+                    "${serviceState.currentDbFs.toInt()} dBFS",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
+            Spacer(modifier = Modifier.height(4.dp))
+            val vuProgress = ((serviceState.currentDbFs + 60f) / 60f).coerceIn(0f, 1f)
+            LinearProgressIndicator(
+                progress = { vuProgress },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(8.dp)
+                    .clip(RoundedCornerShape(4.dp)),
+                color = if (vuProgress > 0.8f) Color(0xFFDC2626) else if (vuProgress > 0.5f) Color(0xFFF59E0B) else Color(0xFF16A34A),
+                trackColor = MaterialTheme.colorScheme.surfaceVariant
+            )
 
-            // Centerpiece Destination & Instruction
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(16.dp)
-            ) {
-                if (alert.destination.isNotEmpty()) {
-                    Surface(
-                        shape = RoundedCornerShape(20.dp),
-                        color = Color.White,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(vertical = 22.dp, horizontal = 16.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
+            // Latest Recognized Announcement
+            if (serviceState.latestTranscript.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Surface(
+                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(10.dp)) {
+                        Text(
+                            "📢 最新認識: \"${serviceState.latestTranscript}\"",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        if (serviceState.latestMatchedInfo.isNotEmpty()) {
                             Text(
-                                text = "GO TO DESTINATION",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = Color.DarkGray,
+                                "👉 ${serviceState.latestMatchedInfo}",
+                                fontSize = 12.sp,
+                                color = Color(0xFF16A34A),
                                 fontWeight = FontWeight.Bold
-                            )
-                            Spacer(modifier = Modifier.height(6.dp))
-                            Text(
-                                text = alert.destination,
-                                color = Color.Black,
-                                fontWeight = FontWeight.Black,
-                                fontSize = 32.sp,
-                                lineHeight = 38.sp,
-                                textAlign = TextAlign.Center
                             )
                         }
                     }
                 }
+            }
 
-                Text(
-                    text = alert.instructionPlain.ifEmpty { "You were called!" },
-                    color = Color.White,
-                    fontWeight = FontWeight.ExtraBold,
-                    fontSize = 26.sp,
-                    lineHeight = 32.sp,
-                    textAlign = TextAlign.Center
+            // Quick Manual Simulation Call
+            Spacer(modifier = Modifier.height(14.dp))
+            HorizontalDivider()
+            Spacer(modifier = Modifier.height(10.dp))
+            Text("手動呼出テスト (音声なしでプッシュ通知)", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = simCallInput,
+                    onValueChange = onSimCallInputChange,
+                    modifier = Modifier.weight(1f),
+                    textStyle = LocalTextStyle.current.copy(fontSize = 12.sp),
+                    singleLine = true
+                )
+                Button(
+                    onClick = { onSimulateCall(simCallInput) },
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text("呼出", fontSize = 12.sp)
+                }
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Component: New Patient Check-in Card (Reception Desk)
+// -----------------------------------------------------------------------------
+
+@Composable
+fun NewPatientCheckinCard(
+    nextTicketNumber: Int,
+    nameInput: String,
+    onNameInputChange: (String) -> Unit,
+    ticketInput: String,
+    onTicketInputChange: (String) -> Unit,
+    selectedDestination: String,
+    onDestinationChange: (String) -> Unit,
+    customDestInput: String,
+    onCustomDestInputChange: (String) -> Unit,
+    proposedReadings: List<ReadingOption>,
+    onRegisterPatient: () -> Unit
+) {
+    val commonDests = listOf("3番診察室 (Exam Room 3)", "1番診察室", "2番診察室", "2番窓口", "会計窓口", "お薬窓口")
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text("📝 新規患者受付 (Check-in)", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // Ticket & Name Row
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(
+                    value = ticketInput,
+                    onValueChange = onTicketInputChange,
+                    label = { Text("番号 (#$nextTicketNumber)") },
+                    placeholder = { Text("#$nextTicketNumber") },
+                    modifier = Modifier.weight(0.35f),
+                    singleLine = true
                 )
 
-                if (alert.transcriptMasked.isNotEmpty()) {
-                    Text(
-                        text = "「${alert.transcriptMasked}」",
-                        color = Color.White.copy(alpha = 0.92f),
-                        fontSize = 17.sp,
-                        textAlign = TextAlign.Center
-                    )
-                }
-
-                Text(
-                    text = "Matched: ${alert.matchedTrigger} • Latency: ${alert.latencyMs} ms",
-                    color = Color.White.copy(alpha = 0.8f),
-                    style = MaterialTheme.typography.labelMedium
+                OutlinedTextField(
+                    value = nameInput,
+                    onValueChange = onNameInputChange,
+                    label = { Text("お名前 (漢字・英語)") },
+                    placeholder = { Text("例: 東海林 太郎") },
+                    modifier = Modifier.weight(0.65f),
+                    singleLine = true
                 )
             }
 
-            // Bottom Action Buttons (10s Replay + Dismiss)
-            Column(
+            // Proposed Reading Chips
+            if (proposedReadings.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text("よみがな候補 (音声認識用):", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    proposedReadings.forEach { opt ->
+                        AssistChip(
+                            onClick = {},
+                            label = { Text("${opt.fullReading} (${opt.surnameReading})", fontSize = 11.sp) }
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+            Text("行先 (Destination):", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(modifier = Modifier.height(6.dp))
+
+            Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(bottom = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                if (hasReplayClip) {
-                    Button(
-                        onClick = onReplay10s,
-                        enabled = !isReplaying,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color.White,
-                            contentColor = Color.Black
-                        ),
-                        shape = RoundedCornerShape(16.dp),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(60.dp)
-                    ) {
+                commonDests.forEach { dest ->
+                    FilterChip(
+                        selected = selectedDestination == dest,
+                        onClick = { onDestinationChange(dest) },
+                        label = { Text(dest.take(10), fontSize = 11.sp) }
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            Button(
+                onClick = onRegisterPatient,
+                enabled = nameInput.isNotBlank() || ticketInput.isNotBlank(),
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(10.dp)
+            ) {
+                Text("受付登録 ＆ QRコード表示 📲", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Component: Today's Queue Card
+// -----------------------------------------------------------------------------
+
+@Composable
+fun TodayQueueCard(
+    selectedTab: Int,
+    onSelectTab: (Int) -> Unit,
+    totalCount: Int,
+    waitingCount: Int,
+    calledCount: Int,
+    completedCount: Int,
+    patients: List<DailyPatientEntry>,
+    onShowQr: (DailyPatientEntry) -> Unit,
+    onCallPatient: (DailyPatientEntry) -> Unit,
+    onMarkCompleted: (String) -> Unit,
+    onRemovePatient: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Card(
+        modifier = modifier.fillMaxSize(),
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+            Text("📋 本日の待合リスト (Daily Queue)", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // Tabs
+            TabRow(selectedTabIndex = selectedTab) {
+                Tab(selected = selectedTab == 0, onClick = { onSelectTab(0) }, text = { Text("すべて ($totalCount)") })
+                Tab(selected = selectedTab == 1, onClick = { onSelectTab(1) }, text = { Text("待合中 ($waitingCount)") })
+                Tab(selected = selectedTab == 2, onClick = { onSelectTab(2) }, text = { Text("呼出中 ($calledCount)") })
+                Tab(selected = selectedTab == 3, onClick = { onSelectTab(3) }, text = { Text("完了 ($completedCount)") })
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            if (patients.isEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(32.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        "登録された患者様はいません。\n左側のフォームから受付登録を行ってください。",
+                        textAlign = TextAlign.Center,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 14.sp
+                    )
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(patients, key = { it.id }) { patient ->
+                        PatientQueueRow(
+                            patient = patient,
+                            onShowQr = { onShowQr(patient) },
+                            onCall = { onCallPatient(patient) },
+                            onDone = { onMarkCompleted(patient.id) },
+                            onDelete = { onRemovePatient(patient.id) }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun PatientQueueRow(
+    patient: DailyPatientEntry,
+    onShowQr: () -> Unit,
+    onCall: () -> Unit,
+    onDone: () -> Unit,
+    onDelete: () -> Unit
+) {
+    val statusColor = when (patient.status) {
+        PatientQueueStatus.WAITING -> Color(0xFF0284C7)
+        PatientQueueStatus.CALLED -> Color(0xFF16A34A)
+        PatientQueueStatus.RECALL -> Color(0xFFDC2626)
+        PatientQueueStatus.COMPLETED -> Color(0xFF64748B)
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(10.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)),
+        color = MaterialTheme.colorScheme.surface
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            // Left info: Ticket, Name, Dest
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                // Ticket Number Badge
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.primaryContainer,
+                    modifier = Modifier.size(48.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
                         Text(
-                            text = if (isReplaying) "🔊 Replaying Last 10s Audio…" else "🔊 Replay Last 10s Audio",
-                            fontSize = 18.sp,
-                            fontWeight = FontWeight.ExtraBold
+                            "#${patient.ticketNumber}",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 16.sp,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer
                         )
                     }
                 }
 
-                OutlinedButton(
-                    onClick = onDismiss,
-                    colors = ButtonDefaults.outlinedButtonColors(
-                        containerColor = Color.Black.copy(alpha = 0.25f),
-                        contentColor = Color.White
-                    ),
-                    border = androidx.compose.foundation.BorderStroke(2.dp, Color.White),
-                    shape = RoundedCornerShape(16.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(58.dp)
+                Column {
+                    Text(
+                        patient.name,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 15.sp
+                    )
+                    Text(
+                        "📍 ${patient.destination}  •  ${patient.waitMinutes}分前",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            // Right actions: Status + Buttons
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = statusColor.copy(alpha = 0.15f)
                 ) {
                     Text(
-                        text = "✓ I'm On My Way (Stop Buzz)",
-                        fontSize = 17.sp,
-                        fontWeight = FontWeight.Bold
+                        patient.status.name,
+                        color = statusColor,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 10.sp,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                     )
+                }
+
+                IconButton(onClick = onShowQr, modifier = Modifier.size(36.dp)) {
+                    Text("📱", fontSize = 18.sp)
+                }
+                IconButton(onClick = onCall, modifier = Modifier.size(36.dp)) {
+                    Text("📣", fontSize = 18.sp)
+                }
+                if (patient.status != PatientQueueStatus.COMPLETED) {
+                    IconButton(onClick = onDone, modifier = Modifier.size(36.dp)) {
+                        Text("✅", fontSize = 18.sp)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Component: Modals (Patient QR Code & Countertop Stand QR)
+// -----------------------------------------------------------------------------
+
+@Composable
+fun PatientQrCodeDialog(
+    patient: DailyPatientEntry,
+    baseUrl: String,
+    onDismiss: () -> Unit
+) {
+    val pwaUrl = patient.toPwaUrl(baseUrl)
+    val qrBitmap = remember(pwaUrl) {
+        QrCodeBitmapGenerator.encodeToBitmap(pwaUrl, sizePx = 512)
+    }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(24.dp),
+                horizontalAlignment = Alignment.CenterAlignment
+            ) {
+                Text(
+                    "#${patient.ticketNumber}  ${patient.name}",
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    "行先: ${patient.destination}",
+                    fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                Image(
+                    bitmap = qrBitmap.asImageBitmap(),
+                    contentDescription = "Patient QR Code",
+                    modifier = Modifier
+                        .size(220.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(10.dp))
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                Text(
+                    "院外（カフェ・お車等）でお待ちの方はこちらをお手元のスマホでスキャンしてください。\n呼び出し時にスマホが振動・通知します。",
+                    textAlign = TextAlign.Center,
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    lineHeight = 16.sp
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                Button(
+                    onClick = onDismiss,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("閉じる")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun CounterStandQrDialog(
+    baseUrl: String,
+    onDismiss: () -> Unit
+) {
+    val standUrl = baseUrl.trimEnd('/') + "/"
+    val qrBitmap = remember(standUrl) {
+        QrCodeBitmapGenerator.encodeToBitmap(standUrl, sizePx = 600)
+    }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            shape = RoundedCornerShape(18.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            modifier = Modifier.padding(12.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(28.dp),
+                horizontalAlignment = Alignment.CenterAlignment
+            ) {
+                Text(
+                    "院外でお待ちいただけます 🌿",
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Text(
+                    "カフェ・屋外ガーデン・お車などで待機可能",
+                    fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Spacer(modifier = Modifier.height(20.dp))
+
+                Image(
+                    bitmap = qrBitmap.asImageBitmap(),
+                    contentDescription = "Counter Stand QR Code",
+                    modifier = Modifier
+                        .size(260.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .border(2.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+                )
+
+                Spacer(modifier = Modifier.height(18.dp))
+
+                Text(
+                    "スマートフォンで上記QRコードを読み取り、\n受付番号またはお名前をご入力ください。\n順番になるとスマホが強く振動してご案内します。",
+                    textAlign = TextAlign.Center,
+                    fontSize = 13.sp,
+                    lineHeight = 18.sp,
+                    fontWeight = FontWeight.Medium
+                )
+
+                Spacer(modifier = Modifier.height(20.dp))
+
+                Button(
+                    onClick = onDismiss,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("受付画面に戻る")
                 }
             }
         }

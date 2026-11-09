@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#0284c7">
+  <title>Yobareta (呼ばれた) - Waiting Queue Alert</title>
+  <link rel="manifest" href="/manifest.json">
+  <link rel="stylesheet" href="/css/style.css">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Yobareta">
+</head>
+<body>
+
+  <!-- App Header -->
+  <header class="app-header">
+    <div class="brand">
+      <div class="brand-icon">呼</div>
+      <div>
+        <div class="brand-title">Yobareta (呼ばれた)</div>
+        <div class="brand-sub">Hospital & Clinic Queue Assistant</div>
+      </div>
+    </div>
+    <div id="statusBadge" class="status-badge">
+      <span id="statusDot" class="status-dot"></span>
+      <span id="statusText">Ready</span>
+    </div>
+  </header>
+
+  <!-- Main Patient View -->
+  <main class="container">
+
+    <!-- Step 1: Check-in Card (Shown when not in queue) -->
+    <div id="checkinCard" class="card">
+      <h2 class="card-title">Check-in to Queue / 順番待ち受付</h2>
+      <p class="card-desc">
+        Enter your Name or Ticket Number. When the clinic staff calls you over the speaker, your phone will vibrate and alert you immediately.
+      </p>
+
+      <div class="form-group">
+        <label class="form-label" for="nameInput">Your Name (Kanji / Katakana / English) / お名前</label>
+        <input type="text" id="nameInput" class="form-input" placeholder="例: 東海林 太郎 または Alex Smith" autocomplete="name">
+        <div id="readingChips" class="reading-chips"></div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="ticketInput">Ticket / Order # (Optional) / 番号札</label>
+        <input type="text" id="ticketInput" class="form-input" placeholder="例: 305 または A-12" inputmode="numeric">
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="venueSelect">Venue Type / 施設区分</label>
+        <select id="venueSelect" class="form-input">
+          <option value="auto">Auto Detect (Hospital / Clinic / Dining)</option>
+          <option value="hospital">Hospital Outpatient / 総合病院</option>
+          <option value="clinic">Clinic / 一般クリニック</option>
+          <option value="ward">Ward Office / 区役所・市役所</option>
+          <option value="cafe">Café / Restaurant</option>
+        </select>
+      </div>
+
+      <button id="checkinBtn" class="btn btn-primary" type="button">
+        Join Waiting List / 受付を開始する
+      </button>
+
+      <div style="margin-top: 16px; text-align: center;">
+        <a href="/nurse.html" style="font-size: 0.8rem; color: var(--text-muted); text-decoration: none;">
+          Nurse Station Desk Mic →
+        </a>
+      </div>
+    </div>
+
+    <!-- Step 2: Waiting State (Shown when active) -->
+    <div id="waitingCard" class="card hidden">
+      <div class="waiting-hero">
+        <div class="pulse-indicator">
+          <span class="pulse-circle"></span>
+          <span>Waiting for your turn / 呼び出し待機中</span>
+        </div>
+
+        <div id="displayTicket" class="ticket-number-display">-</div>
+        <div id="displayName" class="patient-name-display">-</div>
+
+        <div class="freedom-box">
+          <strong>🌿 You can wait freely outside:</strong><br>
+          You do not need to stay in the noisy waiting room. Feel free to wait in the cafeteria, outside garden, or in your car. Keep this page open; your phone will vibrate and alert you when called.
+        </div>
+      </div>
+
+      <div style="display: flex; gap: 10px; margin-bottom: 12px;">
+        <button id="testAlertBtn" class="btn btn-secondary" type="button">
+          🔔 Test Vibration & Chime
+        </button>
+        <button id="leaveBtn" class="btn btn-secondary" type="button" style="color: var(--danger);">
+          Leave Queue / 受付取消
+        </button>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- Fullscreen Alert Overlay Banner -->
+  <div id="alertOverlay" class="alert-overlay hidden">
+    <div id="alertTierBadge" class="alert-badge">CALLED</div>
+    <div id="alertDestination" class="alert-destination">Exam Room 3</div>
+    <div id="alertInstruction" class="alert-instruction">You were called → Please proceed to Exam Room 3</div>
+    <button id="dismissAlertBtn" class="alert-dismiss-btn" type="button">
+      I Am On My Way / 向かいます
+    </button>
+  </div>
+
+  <script src="/js/patient.js"></script>
+</body>
+</html>
