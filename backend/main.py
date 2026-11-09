@@ -131,8 +131,10 @@ class RecognizeJsonRequest(BaseModel):
 
 
 class PatientCheckinRequest(BaseModel):
+    session_id: Optional[str] = Field(default=None, description="Optional pre-assigned session ID from nurse tablet")
     name: str = Field(description="Patient display/kanji/English name")
     ticket_number: str = Field(default="", description="Waiting ticket or order number")
+    destination: str = Field(default="", description="Assigned destination room/counter")
     full_name_readings: List[str] = Field(default_factory=list)
     surname_readings: List[str] = Field(default_factory=list)
     given_name_readings: List[str] = Field(default_factory=list)
@@ -407,6 +409,8 @@ async def patient_checkin(req: PatientCheckinRequest) -> dict:
         surname_readings=req.surname_readings,
         given_name_readings=req.given_name_readings,
         venue_mode=req.venue_mode,
+        session_id=req.session_id,
+        destination=req.destination,
     )
     return session.to_summary()
 

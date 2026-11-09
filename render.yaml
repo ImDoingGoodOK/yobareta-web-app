@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: yobareta-web-app
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: REQUIRE_AUTH
+        value: "false"
+      - key: REQUIRE_APP_CHECK
+        value: "false"

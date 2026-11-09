@@ -5,12 +5,14 @@ class PatientClient {
     this.session = null;
     this.ws = null;
     this.reconnectTimer = null;
+    this.pollTimer = null;
+    this.lastHandledCallCount = 0;
     this.audioCtx = null;
     this.vibrateInterval = null;
 
     this.initElements();
     this.bindEvents();
-    this.restoreSession();
+    this.initSessionFromUrlOrStorage();
     this.registerServiceWorker();
   }
 
@@ -27,6 +29,7 @@ class PatientClient {
 
     this.displayTicket = document.getElementById('displayTicket');
     this.displayName = document.getElementById('displayName');
+    this.displayTempId = document.getElementById('displayTempId');
     this.statusBadge = document.getElementById('statusBadge');
     this.statusDot = document.getElementById('statusDot');
     this.statusText = document.getElementById('statusText');
@@ -40,10 +43,31 @@ class PatientClient {
 
   bindEvents() {
     this.nameInput.addEventListener('input', () => this.generateReadingChips(this.nameInput.value));
-    this.checkinBtn.addEventListener('click', () => this.handleCheckin());
+    this.checkinBtn.addEventListener('click', () => {
+      this.unlockAudio();
+      this.handleCheckin();
+    });
     this.leaveBtn.addEventListener('click', () => this.handleLeaveQueue());
-    this.testAlertBtn.addEventListener('click', () => this.triggerTestAlert());
+    this.testAlertBtn.addEventListener('click', () => {
+      this.unlockAudio();
+      this.triggerTestAlert();
+    });
     this.dismissAlertBtn.addEventListener('click', () => this.dismissAlert());
+
+    // Unlock Web Audio API on first user touch anywhere on the page
+    document.body.addEventListener('touchstart', () => this.unlockAudio(), { once: true });
+    document.body.addEventListener('click', () => this.unlockAudio(), { once: true });
+  }
+
+  unlockAudio() {
+    try {
+      if (!this.audioCtx) {
+        this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (this.audioCtx.state === 'suspended') {
+        this.audioCtx.resume();
+      }
+    } catch (_) {}
   }
 
   registerServiceWorker() {
@@ -56,10 +80,10 @@ class PatientClient {
 
   // Pre-generate readings locally for common multi-reading surnames
   generateReadingChips(name) {
-    const trimmed = name.trim();
+    const trimmed = (name || '').trim();
     if (!trimmed) {
       this.readingChips.innerHTML = '';
-      return;
+      return [];
     }
 
     const dict = {
@@ -94,6 +118,66 @@ class PatientClient {
       chip.textContent = rd;
       this.readingChips.appendChild(chip);
     });
+    return unique;
+  }
+
+  async initSessionFromUrlOrStorage() {
+    const params = new URLSearchParams(window.location.search);
+    const qrSid = params.get('sid') || '';
+    const qrTicket = params.get('ticket') || params.get('t') || '';
+    const qrName = params.get('name') || params.get('n') || '';
+    const qrDest = params.get('dest') || '';
+
+    // If opened by scanning a Patient QR code from the Nurse Tablet App:
+    if (qrSid || qrTicket || qrName) {
+      this.nameInput.value = qrName;
+      this.ticketInput.value = qrTicket;
+      const readings = this.generateReadingChips(qrName);
+
+      try {
+        const resp = await fetch('/api/patient/checkin', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            session_id: qrSid || undefined,
+            name: qrName || `Ticket #${qrTicket}`,
+            ticket_number: qrTicket,
+            destination: qrDest || undefined,
+            full_name_readings: readings,
+            surname_readings: readings.slice(0, 3),
+            given_name_readings: readings.slice(0, 2),
+            venue_mode: 'auto'
+          })
+        });
+
+        if (resp.ok) {
+          const data = await resp.json();
+          this.session = data;
+          this.lastHandledCallCount = data.call_count || 0;
+          localStorage.setItem('yobareta_patient_session', JSON.stringify(this.session));
+          // Clean query params from address bar so refresh stays clean
+          window.history.replaceState({}, document.title, window.location.pathname);
+          this.showWaitingState();
+          this.startLiveMonitoring();
+          return;
+        }
+      } catch (err) {
+        console.warn('Auto check-in from QR failed, falling back:', err);
+      }
+    }
+
+    // Otherwise restore from localStorage if available
+    const stored = localStorage.getItem('yobareta_patient_session');
+    if (stored) {
+      try {
+        this.session = JSON.parse(stored);
+        this.lastHandledCallCount = this.session.call_count || 0;
+        this.showWaitingState();
+        this.startLiveMonitoring();
+      } catch (_) {
+        localStorage.removeItem('yobareta_patient_session');
+      }
+    }
   }
 
   async handleCheckin() {
@@ -109,7 +193,6 @@ class PatientClient {
     this.checkinBtn.disabled = true;
     this.checkinBtn.textContent = 'Joining Waiting List...';
 
-    // Collect reading pills
     const readings = Array.from(this.readingChips.querySelectorAll('.chip')).map((c) => c.textContent);
 
     try {
@@ -132,28 +215,16 @@ class PatientClient {
 
       const data = await resp.json();
       this.session = data;
+      this.lastHandledCallCount = data.call_count || 0;
       localStorage.setItem('yobareta_patient_session', JSON.stringify(this.session));
 
       this.showWaitingState();
-      this.connectWebSocket();
+      this.startLiveMonitoring();
     } catch (err) {
       alert(`Check-in error: ${err.message}`);
     } finally {
       this.checkinBtn.disabled = false;
       this.checkinBtn.textContent = 'Join Waiting List / 受付を開始する';
-    }
-  }
-
-  restoreSession() {
-    const stored = localStorage.getItem('yobareta_patient_session');
-    if (stored) {
-      try {
-        this.session = JSON.parse(stored);
-        this.showWaitingState();
-        this.connectWebSocket();
-      } catch (_) {
-        localStorage.removeItem('yobareta_patient_session');
-      }
     }
   }
 
@@ -163,6 +234,14 @@ class PatientClient {
 
     this.displayTicket.textContent = this.session.ticket_number ? `#${this.session.ticket_number}` : '✓';
     this.displayName.textContent = this.session.name;
+    if (this.displayTempId) {
+      this.displayTempId.textContent = `Temporary ID: ${this.session.session_id} ${this.session.destination ? '• ' + this.session.destination : ''}`;
+    }
+  }
+
+  startLiveMonitoring() {
+    this.connectWebSocket();
+    this.startPollingFallback();
   }
 
   connectWebSocket() {
@@ -171,38 +250,77 @@ class PatientClient {
       return;
     }
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws/patient/${this.session.session_id}`;
+    try {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${window.location.host}/ws/patient/${this.session.session_id}`;
 
-    this.ws = new WebSocket(wsUrl);
+      this.ws = new WebSocket(wsUrl);
 
-    this.ws.onopen = () => {
-      this.setOnlineStatus(true);
-      if (this.reconnectTimer) {
-        clearInterval(this.reconnectTimer);
-        this.reconnectTimer = null;
-      }
-    };
-
-    this.ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'alert') {
-          this.triggerAlert(msg);
+      this.ws.onopen = () => {
+        this.setOnlineStatus(true);
+        if (this.reconnectTimer) {
+          clearInterval(this.reconnectTimer);
+          this.reconnectTimer = null;
         }
-      } catch (e) {
-        console.error('Error parsing WS message:', e);
+      };
+
+      this.ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'alert') {
+            if (msg.call_count) {
+              this.lastHandledCallCount = msg.call_count;
+            } else {
+              this.lastHandledCallCount += 1;
+            }
+            this.triggerAlert(msg);
+          }
+        } catch (e) {
+          console.error('Error parsing WS message:', e);
+        }
+      };
+
+      this.ws.onclose = () => {
+        this.scheduleReconnect();
+      };
+
+      this.ws.onerror = () => {
+        // Polling fallback keeps monitoring active even if WS is unsupported
+      };
+    } catch (_) {}
+  }
+
+  startPollingFallback() {
+    if (this.pollTimer) clearInterval(this.pollTimer);
+    const poll = async () => {
+      if (!this.session) return;
+      try {
+        const resp = await fetch(`/api/patient/${this.session.session_id}`);
+        if (resp.ok) {
+          this.setOnlineStatus(true);
+          const data = await resp.json();
+          if (data.name && data.name !== this.session.name) {
+            this.session.name = data.name;
+            this.displayName.textContent = data.name;
+          }
+          if (data.ticket_number && data.ticket_number !== this.session.ticket_number) {
+            this.session.ticket_number = data.ticket_number;
+            this.displayTicket.textContent = `#${data.ticket_number}`;
+          }
+          const serverCallCount = data.call_count || 0;
+          if (serverCallCount > this.lastHandledCallCount && data.latest_alert) {
+            this.lastHandledCallCount = serverCallCount;
+            this.triggerAlert(data.latest_alert);
+          }
+        }
+      } catch (_) {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+          this.setOnlineStatus(false);
+        }
       }
     };
-
-    this.ws.onclose = () => {
-      this.setOnlineStatus(false);
-      this.scheduleReconnect();
-    };
-
-    this.ws.onerror = () => {
-      this.setOnlineStatus(false);
-    };
+    poll();
+    this.pollTimer = setInterval(poll, 1500);
   }
 
   scheduleReconnect() {
@@ -211,7 +329,7 @@ class PatientClient {
       if (this.session) {
         this.connectWebSocket();
       }
-    }, 4000);
+    }, 5000);
   }
 
   setOnlineStatus(online) {
@@ -314,6 +432,10 @@ class PatientClient {
     if (this.ws) {
       this.ws.close();
       this.ws = null;
+    }
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
     }
 
     this.dismissAlert();

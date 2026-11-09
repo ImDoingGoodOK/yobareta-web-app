@@ -242,6 +242,20 @@ object KanjiReadingProposer {
             surnameHints.filter { it.isNotBlank() }.distinct()
     }
 
+    fun buildFullNameHints(
+        nameInput: String,
+        options: List<ReadingOption>
+    ): List<String> {
+        return buildMatchHints(nameInput, options).first
+    }
+
+    fun buildSurnameHints(
+        nameInput: String,
+        options: List<ReadingOption>
+    ): List<String> {
+        return buildMatchHints(nameInput, options).second
+    }
+
     fun buildGivenNameHints(
         nameInput: String,
         options: List<ReadingOption>

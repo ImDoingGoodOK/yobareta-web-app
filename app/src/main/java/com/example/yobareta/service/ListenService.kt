@@ -299,8 +299,10 @@ class ListenService : Service() {
                                 qm.markPatientCalledByMatch(m.ticket.ifEmpty { m.name }, m.destination)
                             }
                         }
+                        return@launch
                     } catch (e: Exception) {
                         Log.w(TAG, "Nurse desk announce failed: ${e.message}")
+                        return@launch
                     }
                 }
 

@@ -181,24 +181,33 @@ class YobaretaCloudClient(
     ): Boolean = withContext(Dispatchers.IO) {
         val baseUrl = resolveBaseUrl(baseUrlOverride)
         val bodyJson = JSONObject().apply {
+            put("session_id", entry.id)
             put("name", entry.name)
             put("ticket_number", entry.ticketNumber)
+            put("destination", entry.destination)
             put("full_name_readings", JSONArray(entry.fullReadings))
             put("surname_readings", JSONArray(entry.surnameReadings))
             put("given_name_readings", JSONArray(entry.givenReadings))
             put("venue_mode", "auto")
         }
 
-        val reqBuilder = Request.Builder()
-            .url("$baseUrl/api/patient/checkin")
-            .post(bodyJson.toString().toRequestBody(JSON_MEDIA_TYPE))
-        if (AppConfig.API_SECRET.isNotEmpty()) {
-            reqBuilder.addHeader("X-Yobareta-Secret", AppConfig.API_SECRET)
-        }
+        for (target in listOf(baseUrl, "http://10.0.2.2:8080").distinct()) {
+            try {
+                val reqBuilder = Request.Builder()
+                    .url("$target/api/patient/checkin")
+                    .post(bodyJson.toString().toRequestBody(JSON_MEDIA_TYPE))
+                if (AppConfig.API_SECRET.isNotEmpty()) {
+                    reqBuilder.addHeader("X-Yobareta-Secret", AppConfig.API_SECRET)
+                }
 
-        httpClient.newCall(reqBuilder.build()).execute().use { resp ->
-            resp.isSuccessful
+                val ok = httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+                    resp.isSuccessful
+                }
+                if (ok) return@withContext true
+            } catch (_: Exception) {
+            }
         }
+        false
     }
 
     suspend fun removePatientFromCloud(
@@ -227,38 +236,73 @@ class YobaretaCloudClient(
             put("transcript", transcript)
         }
 
-        val reqBuilder = Request.Builder()
-            .url("$baseUrl/api/nurse/simulate")
-            .post(bodyJson.toString().toRequestBody(JSON_MEDIA_TYPE))
-        if (AppConfig.API_SECRET.isNotEmpty()) {
-            reqBuilder.addHeader("X-Yobareta-Secret", AppConfig.API_SECRET)
-        }
+        for (target in listOf(baseUrl, "http://10.0.2.2:8080").distinct()) {
+            try {
+                val reqBuilder = Request.Builder()
+                    .url("$target/api/nurse/simulate")
+                    .post(bodyJson.toString().toRequestBody(JSON_MEDIA_TYPE))
+                if (AppConfig.API_SECRET.isNotEmpty()) {
+                    reqBuilder.addHeader("X-Yobareta-Secret", AppConfig.API_SECRET)
+                }
 
-        httpClient.newCall(reqBuilder.build()).execute().use { resp ->
-            val rawBody = resp.body?.string() ?: "{}"
-            val json = JSONObject(rawBody)
-            val summaries = mutableListOf<MatchedPatientSummary>()
-            val arr = json.optJSONArray("matches")
-            if (arr != null) {
-                for (i in 0 until arr.length()) {
-                    val m = arr.getJSONObject(i)
-                    summaries.add(
-                        MatchedPatientSummary(
-                            sessionId = m.optString("session_id", ""),
-                            name = m.optString("name", ""),
-                            ticket = m.optString("ticket", ""),
-                            tier = m.optString("tier", "called"),
-                            destination = m.optString("destination", ""),
-                            instruction = m.optString("instruction", "")
-                        )
+                httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use
+                    val rawBody = resp.body?.string() ?: "{}"
+                    val json = JSONObject(rawBody)
+                    val summaries = mutableListOf<MatchedPatientSummary>()
+                    val arr = json.optJSONArray("matches")
+                    if (arr != null) {
+                        for (i in 0 until arr.length()) {
+                            val m = arr.getJSONObject(i)
+                            summaries.add(
+                                MatchedPatientSummary(
+                                    sessionId = m.optString("session_id", ""),
+                                    name = m.optString("name", ""),
+                                    ticket = m.optString("ticket", ""),
+                                    tier = m.optString("tier", "called"),
+                                    destination = m.optString("destination", ""),
+                                    instruction = m.optString("instruction", "")
+                                )
+                            )
+                        }
+                    }
+                    return@withContext NurseAnnounceResult(
+                        transcript = json.optString("transcript", ""),
+                        matchesCount = json.optInt("matches_count", 0),
+                        matchedSummaries = summaries
                     )
                 }
+            } catch (_: Exception) {
             }
-            NurseAnnounceResult(
-                transcript = json.optString("transcript", ""),
-                matchesCount = json.optInt("matches_count", 0),
-                matchedSummaries = summaries
-            )
         }
+        NurseAnnounceResult(transcript = transcript, matchesCount = 0, matchedSummaries = emptyList())
+    }
+
+    /**
+     * Queries the host PC via Android Emulator bridge (10.0.2.2:8080) or LAN IP to auto-discover
+     * the live public HTTPS Cloud Tunnel URL (`https://....lhr.life`) if running.
+     */
+    suspend fun discoverHostServerUrl(): String? = withContext(Dispatchers.IO) {
+        val candidates = listOf("http://10.0.2.2:8080", AppConfig.DEFAULT_CLOUD_RUN_BASE_URL)
+        for (candidate in candidates) {
+            try {
+                val req = Request.Builder()
+                    .url("${candidate.trimEnd('/')}/api/server-info")
+                    .get()
+                    .build()
+                httpClient.newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val body = resp.body?.string() ?: "{}"
+                        val json = JSONObject(body)
+                        val pub = json.optString("public_url", "").trim()
+                        if (pub.startsWith("https://")) return@withContext pub
+                        val rec = json.optString("recommended_qr_base_url", "").trim()
+                        if (rec.isNotEmpty()) return@withContext rec
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+        null
     }
 }

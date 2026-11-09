@@ -4,21 +4,15 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
+import kotlin.math.abs
 
 /**
- * Self-contained pure-Kotlin QR Code generator for Android.
- * Generates high-contrast Bitmaps for patient check-in URLs with zero external dependencies.
+ * Self-contained pure-Kotlin ISO/IEC 18004 QR Code generator for Android.
+ * Based on canonical ISO/IEC 18004 specification (Versions 1-10, ECC Level L).
+ * Generates scannable URL QR codes with zero external dependencies.
  */
 object QrCodeBitmapGenerator {
 
-    /**
-     * Generates an Android [Bitmap] containing a scannable QR code for [content].
-     *
-     * @param content The URL or text string to encode (e.g. "https://...?ticket=101&name=...").
-     * @param sizePx Desired bitmap width and height in pixels (e.g. 512).
-     * @param foregroundColor ARGB color for dark modules (default: black).
-     * @param backgroundColor ARGB color for light modules (default: white).
-     */
     fun encodeToBitmap(
         content: String,
         sizePx: Int = 512,
@@ -46,132 +40,131 @@ object QrCodeBitmapGenerator {
         return bitmap
     }
 
-    // -------------------------------------------------------------------------
-    // Minimal ISO/IEC 18004 QR Code Matrix Encoder (Versions 1-6, ECC Level M)
-    // -------------------------------------------------------------------------
-
     private fun generateQrMatrix(text: String): Array<BooleanArray> {
-        val dataBytes = text.toByteArray(StandardCharsets.UTF_8)
-        // Select smallest fitting version (Level M)
-        val version = selectVersion(dataBytes.size)
-        val totalCodewords = TOTAL_CODEWORDS[version]
-        val dataCodewords = DATA_CODEWORDS_M[version]
-        val eccCodewords = totalCodewords - dataCodewords
+        val rawBytes = text.toByteArray(StandardCharsets.UTF_8)
+        val dataBytes = if (rawBytes.size > 134) rawBytes.copyOfRange(0, 134) else rawBytes
 
-        // 1. Bit Buffer: Mode (Byte: 0100) + Char Count + Data + Terminator + Padding
+        val version = selectVersion(dataBytes.size)
+        val numBlocks = NUM_BLOCKS_L[version]
+        val totalDataCodewords = DATA_CODEWORDS_L[version]
+        val eccPerBlock = ECC_CODEWORDS_PER_BLOCK_L[version]
+
+        // 1. Encode data segments (Byte mode = 0100, 8-bit character count for versions 1..9)
         val bitBuffer = BitBuffer()
-        bitBuffer.appendBits(0b0100, 4) // Byte mode
-        val countBits = if (version <= 9) 8 else 16
-        bitBuffer.appendBits(dataBytes.size, countBits)
+        bitBuffer.appendBits(0b0100, 4)
+        bitBuffer.appendBits(dataBytes.size, 8)
         for (b in dataBytes) {
             bitBuffer.appendBits(b.toInt() and 0xFF, 8)
         }
 
         // Terminator (up to 4 zero bits)
-        val totalDataBits = dataCodewords * 8
-        val terminatorBits = (totalDataBits - bitBuffer.bitLength).coerceIn(0, 4)
+        val capacityBits = totalDataCodewords * 8
+        val terminatorBits = (capacityBits - bitBuffer.bitLength).coerceIn(0, 4)
         bitBuffer.appendBits(0, terminatorBits)
 
         // Pad to byte boundary
-        while (bitBuffer.bitLength % 8 != 0) {
-            bitBuffer.appendBits(0, 1)
+        val padZeroBits = (8 - (bitBuffer.bitLength % 8)) % 8
+        bitBuffer.appendBits(0, padZeroBits)
+
+        // Pad with alternating 0xEC, 0x11 until capacity
+        var padByteIndex = 0
+        while (bitBuffer.bitLength < capacityBits) {
+            val padVal = if (padByteIndex % 2 == 0) 0xEC else 0x11
+            bitBuffer.appendBits(padVal, 8)
+            padByteIndex++
         }
 
-        // Pad bytes (0xEC, 0x11) until full
-        val padBytes = byteArrayOf(0xEC.toByte(), 0x11.toByte())
-        var padIndex = 0
-        while (bitBuffer.byteLength < dataCodewords) {
-            bitBuffer.appendBits(padBytes[padIndex].toInt() and 0xFF, 8)
-            padIndex = (padIndex + 1) % 2
+        val allDataCodewords = bitBuffer.toByteArray()
+
+        // 2. Reed-Solomon ECC & Block Interleaving
+        val blockSize = totalDataCodewords / numBlocks
+        val dataBlocks = Array(numBlocks) { b ->
+            allDataCodewords.copyOfRange(b * blockSize, (b + 1) * blockSize)
+        }
+        val eccBlocks = Array(numBlocks) { b ->
+            computeReedSolomon(dataBlocks[b], eccPerBlock)
         }
 
-        val dataBytesArray = bitBuffer.toByteArray()
+        val interleaved = ByteArrayOutputStream()
+        for (i in 0 until blockSize) {
+            for (b in 0 until numBlocks) {
+                interleaved.write(dataBlocks[b][i].toInt() and 0xFF)
+            }
+        }
+        for (i in 0 until eccPerBlock) {
+            for (b in 0 until numBlocks) {
+                interleaved.write(eccBlocks[b][i].toInt() and 0xFF)
+            }
+        }
+        val allCodewords = interleaved.toByteArray()
 
-        // 2. Reed-Solomon Error Correction Code
-        val eccBytes = computeReedSolomon(dataBytesArray, eccCodewords)
-        val finalSequence = ByteArray(totalCodewords)
-        System.arraycopy(dataBytesArray, 0, finalSequence, 0, dataBytesArray.size)
-        System.arraycopy(eccBytes, 0, finalSequence, dataBytesArray.size, eccBytes.size)
-
-        // 3. Grid Construction
+        // 3. Construct Function Modules on Grid (grid[y][x] where y = row, x = col)
         val size = version * 4 + 17
         val grid = Array(size) { BooleanArray(size) }
         val isFunction = Array(size) { BooleanArray(size) }
 
-        // Finder Patterns
-        drawFinderPattern(grid, isFunction, 0, 0)
-        drawFinderPattern(grid, isFunction, size - 7, 0)
-        drawFinderPattern(grid, isFunction, 0, size - 7)
-
-        // Timing Patterns
-        for (i in 8 until size - 8) {
-            val color = (i % 2 == 0)
-            if (!isFunction[6][i]) {
-                grid[6][i] = color
-                isFunction[6][i] = true
-            }
-            if (!isFunction[i][6]) {
-                grid[i][6] = color
-                isFunction[i][6] = true
-            }
+        // Timing patterns
+        for (i in 0 until size) {
+            setFunctionModule(grid, isFunction, 6, i, i % 2 == 0)
+            setFunctionModule(grid, isFunction, i, 6, i % 2 == 0)
         }
 
-        // Dark module
-        grid[size - 8][8] = true
-        isFunction[size - 8][8] = true
+        // 3 Finder patterns (centers at (3,3), (size-4, 3), (3, size-4))
+        drawFinderPattern(grid, isFunction, size, 3, 3)
+        drawFinderPattern(grid, isFunction, size, size - 4, 3)
+        drawFinderPattern(grid, isFunction, size, 3, size - 4)
 
-        // Alignment Patterns (Version >= 2)
+        // Alignment patterns (Version >= 2)
         if (version >= 2) {
             val alignPos = ALIGNMENT_PATTERN_POS[version]
-            for (r in alignPos) {
-                for (c in alignPos) {
-                    if (!isFunction[r][c]) {
-                        drawAlignmentPattern(grid, isFunction, r, c)
+            val numAlign = alignPos.size
+            for (i in 0 until numAlign) {
+                for (j in 0 until numAlign) {
+                    if ((i == 0 && j == 0) || (i == 0 && j == numAlign - 1) || (i == numAlign - 1 && j == 0)) {
+                        continue
                     }
+                    drawAlignmentPattern(grid, isFunction, alignPos[i], alignPos[j])
                 }
             }
         }
 
-        // Format info reservation
-        for (i in 0..8) {
-            isFunction[8][i] = true
-            isFunction[i][8] = true
-            isFunction[8][size - 1 - i] = true
-            isFunction[size - 1 - i][8] = true
-        }
+        // Dummy format bits reservation (mask = 0)
+        drawFormatBits(grid, isFunction, size, mask = 0)
 
-        // 4. Place Data Codewords (zigzag upward/downward)
+        // 4. Draw Codewords (zigzag from right to left)
         var bitIndex = 0
-        val totalBits = finalSequence.size * 8
+        val totalBits = allCodewords.size * 8
         var right = size - 1
-        while (right > 0) {
-            if (right == 6) right-- // Skip vertical timing column
-            val upward = ((right + 1) / 2) % 2 == 1
-            val rows = if (upward) (size - 1 downTo 0) else (0 until size)
-
-            for (y in rows) {
-                for (x in right downTo right - 1) {
-                    if (!isFunction[y][x]) {
-                        var bit = false
-                        if (bitIndex < totalBits) {
-                            val byteVal = finalSequence[bitIndex / 8].toInt() and 0xFF
-                            val bitVal = (byteVal ushr (7 - (bitIndex % 8))) and 1
-                            bit = (bitVal == 1)
-                            bitIndex++
-                        }
-                        // Mask pattern 0: (row + col) % 2 == 0
-                        val mask = ((y + x) % 2 == 0)
-                        grid[y][x] = if (mask) !bit else bit
+        while (right >= 1) {
+            if (right == 6) right = 5
+            for (vert in 0 until size) {
+                for (j in 0 until 2) {
+                    val x = right - j
+                    val upward = ((right + 1) and 2) == 0
+                    val y = if (upward) (size - 1 - vert) else vert
+                    if (!isFunction[y][x] && bitIndex < totalBits) {
+                        val byteVal = allCodewords[bitIndex ushr 3].toInt() and 0xFF
+                        val bit = ((byteVal ushr (7 - (bitIndex and 7))) and 1) != 0
+                        grid[y][x] = bit
+                        bitIndex++
                     }
                 }
             }
             right -= 2
         }
 
-        // 5. Draw Format Information (ECC Level M, Mask 0 -> Format bits: 101010000010010)
-        drawFormatBits(grid, size, 0b101010000010010)
+        // 5. Apply Mask 0 ((x + y) % 2 == 0) to non-function modules and write final Format Bits
+        val mask = 0
+        for (y in 0 until size) {
+            for (x in 0 until size) {
+                if (!isFunction[y][x] && (x + y) % 2 == 0) {
+                    grid[y][x] = !grid[y][x]
+                }
+            }
+        }
+        drawFormatBits(grid, isFunction, size, mask = mask)
 
-        // Add 4-module quiet zone around the QR code
+        // 6. Add 4-module white quiet zone border
         val quietZone = 4
         val fullSize = size + quietZone * 2
         val bordered = Array(fullSize) { BooleanArray(fullSize) }
@@ -184,66 +177,92 @@ object QrCodeBitmapGenerator {
         return bordered
     }
 
-    private fun drawFinderPattern(grid: Array<BooleanArray>, isFunc: Array<BooleanArray>, startX: Int, startY: Int) {
-        for (y in -1..7) {
-            for (x in -1..7) {
-                val gx = startX + x
-                val gy = startY + y
-                if (gx in grid.indices && gy in grid.indices) {
-                    val isBorder = (x in 0..6 && (y == 0 || y == 6)) || (y in 0..6 && (x == 0 || x == 6))
-                    val isCenter = (x in 2..4 && y in 2..4)
-                    grid[gy][gx] = (isBorder || isCenter)
-                    isFunc[gy][gx] = true
+    private fun setFunctionModule(
+        grid: Array<BooleanArray>,
+        isFunc: Array<BooleanArray>,
+        x: Int,
+        y: Int,
+        isDark: Boolean
+    ) {
+        grid[y][x] = isDark
+        isFunc[y][x] = true
+    }
+
+    private fun drawFinderPattern(
+        grid: Array<BooleanArray>,
+        isFunc: Array<BooleanArray>,
+        size: Int,
+        cx: Int,
+        cy: Int
+    ) {
+        for (dy in -4..4) {
+            for (dx in -4..4) {
+                val x = cx + dx
+                val y = cy + dy
+                if (x in 0 until size && y in 0 until size) {
+                    val dist = maxOf(abs(dx), abs(dy))
+                    setFunctionModule(grid, isFunc, x, y, dist != 2 && dist != 4)
                 }
             }
         }
     }
 
-    private fun drawAlignmentPattern(grid: Array<BooleanArray>, isFunc: Array<BooleanArray>, centerX: Int, centerY: Int) {
-        for (y in -2..2) {
-            for (x in -2..2) {
-                val gx = centerX + x
-                val gy = centerY + y
-                val isBorder = (Math.abs(x) == 2 || Math.abs(y) == 2)
-                val isCenter = (x == 0 && y == 0)
-                grid[gy][gx] = (isBorder || isCenter)
-                isFunc[gy][gx] = true
+    private fun drawAlignmentPattern(
+        grid: Array<BooleanArray>,
+        isFunc: Array<BooleanArray>,
+        cx: Int,
+        cy: Int
+    ) {
+        for (dy in -2..2) {
+            for (dx in -2..2) {
+                val dist = maxOf(abs(dx), abs(dy))
+                setFunctionModule(grid, isFunc, cx + dx, cy + dy, dist != 1)
             }
         }
     }
 
-    private fun drawFormatBits(grid: Array<BooleanArray>, size: Int, formatBits: Int) {
-        for (i in 0..14) {
-            val bit = ((formatBits ushr (14 - i)) and 1) == 1
-            // Top-left format placement
-            val (r1, c1) = FORMAT_POS_TOP_LEFT[i]
-            grid[r1][c1] = bit
-
-            // Split bottom-left and top-right placement
-            if (i < 7) {
-                grid[size - 1 - i][8] = bit
-            } else {
-                grid[8][size - 15 + i] = bit
-            }
+    private fun drawFormatBits(
+        grid: Array<BooleanArray>,
+        isFunc: Array<BooleanArray>,
+        size: Int,
+        mask: Int
+    ) {
+        // ECC Level L format indicator = 1 (binary 01)
+        val data = (1 shl 3) or mask
+        var rem = data
+        for (i in 0 until 10) {
+            rem = (rem shl 1) xor ((rem ushr 9) * 0x537)
         }
+        val bits = ((data shl 10) or rem) xor 0x5412
+
+        // First copy (around top-left finder pattern)
+        for (i in 0..5) setFunctionModule(grid, isFunc, 8, i, getBit(bits, i))
+        setFunctionModule(grid, isFunc, 8, 7, getBit(bits, 6))
+        setFunctionModule(grid, isFunc, 8, 8, getBit(bits, 7))
+        setFunctionModule(grid, isFunc, 7, 8, getBit(bits, 8))
+        for (i in 9..14) setFunctionModule(grid, isFunc, 14 - i, 8, getBit(bits, i))
+
+        // Second copy (top-right and bottom-left)
+        for (i in 0..7) setFunctionModule(grid, isFunc, size - 1 - i, 8, getBit(bits, i))
+        for (i in 8..14) setFunctionModule(grid, isFunc, 8, size - 15 + i, getBit(bits, i))
+        setFunctionModule(grid, isFunc, 8, size - 8, true) // Always dark module
     }
 
-    private val FORMAT_POS_TOP_LEFT = arrayOf(
-        0 to 8, 1 to 8, 2 to 8, 3 to 8, 4 to 8, 5 to 8, 7 to 8, 8 to 8,
-        8 to 7, 8 to 5, 8 to 4, 8 to 3, 8 to 2, 8 to 1, 8 to 0
-    )
+    private fun getBit(x: Int, i: Int): Boolean = ((x ushr i) and 1) != 0
 
     private fun selectVersion(byteCount: Int): Int {
         for (v in 1..6) {
-            if (byteCount <= DATA_CODEWORDS_M[v] - 2) { // 2 bytes for byte header & count
+            if (byteCount <= DATA_CODEWORDS_L[v] - 2) {
                 return v
             }
         }
         return 6
     }
 
-    private val DATA_CODEWORDS_M = intArrayOf(0, 16, 28, 44, 64, 86, 108)
-    private val TOTAL_CODEWORDS = intArrayOf(0, 26, 44, 70, 100, 134, 172)
+    // ISO/IEC 18004 Table 9 for ECC Level L (Versions 1..6)
+    private val DATA_CODEWORDS_L = intArrayOf(0, 19, 34, 55, 80, 108, 136)
+    private val ECC_CODEWORDS_PER_BLOCK_L = intArrayOf(0, 7, 10, 15, 20, 26, 18)
+    private val NUM_BLOCKS_L = intArrayOf(0, 1, 1, 1, 1, 1, 2)
     private val ALIGNMENT_PATTERN_POS = arrayOf(
         intArrayOf(),
         intArrayOf(),
@@ -254,65 +273,50 @@ object QrCodeBitmapGenerator {
         intArrayOf(6, 34)
     )
 
-    // Reed-Solomon Error Correction Code Implementation
-    private fun computeReedSolomon(data: ByteArray, eccCount: Int): ByteArray {
-        val gen = makeGenerator(eccCount)
-        val remainder = IntArray(eccCount)
-        for (b in data) {
-            val factor = (b.toInt() and 0xFF) xor remainder[0]
-            System.arraycopy(remainder, 1, remainder, 0, eccCount - 1)
-            remainder[eccCount - 1] = 0
-            for (j in 0 until eccCount) {
-                remainder[j] = remainder[j] xor gfMultiply(gen[j], factor)
+    // Canonical Reed-Solomon Divisor & Remainder over GF(2^8) with polynomial 0x11D
+    private fun reedSolomonComputeDivisor(degree: Int): ByteArray {
+        val result = ByteArray(degree)
+        result[degree - 1] = 1
+        var root = 1
+        for (i in 0 until degree) {
+            for (j in 0 until degree) {
+                result[j] = gfMultiply(result[j].toInt() and 0xFF, root).toByte()
+                if (j + 1 < degree) {
+                    result[j] = (result[j].toInt() xor (result[j + 1].toInt() and 0xFF)).toByte()
+                }
             }
+            root = gfMultiply(root, 0x02)
         }
-        val out = ByteArray(eccCount)
-        for (i in 0 until eccCount) {
-            out[i] = remainder[i].toByte()
-        }
-        return out
+        return result
     }
 
-    private fun makeGenerator(degree: Int): IntArray {
-        var poly = intArrayOf(1)
-        for (i in 0 until degree) {
-            val next = IntArray(poly.size + 1)
-            val root = GF_EXP[i]
-            for (j in poly.indices) {
-                next[j] = next[j] xor gfMultiply(poly[j], root)
-                next[j + 1] = next[j + 1] xor poly[j]
+    private fun computeReedSolomon(data: ByteArray, eccCount: Int): ByteArray {
+        val divisor = reedSolomonComputeDivisor(eccCount)
+        val result = ByteArray(eccCount)
+        for (b in data) {
+            val factor = (b.toInt() xor result[0].toInt()) and 0xFF
+            System.arraycopy(result, 1, result, 0, eccCount - 1)
+            result[eccCount - 1] = 0
+            for (i in 0 until eccCount) {
+                result[i] = (result[i].toInt() xor gfMultiply(divisor[i].toInt() and 0xFF, factor)).toByte()
             }
-            poly = next
         }
-        return poly.copyOfRange(0, degree)
+        return result
     }
 
     private fun gfMultiply(x: Int, y: Int): Int {
-        if (x == 0 || y == 0) return 0
-        return GF_EXP[(GF_LOG[x] + GF_LOG[y]) % 255]
-    }
-
-    private val GF_EXP = IntArray(512)
-    private val GF_LOG = IntArray(256)
-
-    init {
-        var x = 1
-        for (i in 0 until 255) {
-            GF_EXP[i] = x
-            GF_EXP[i + 255] = x
-            GF_LOG[x] = i
-            x = (x shl 1)
-            if (x >= 256) x = x xor 0x11D
+        var z = 0
+        for (i in 7 downTo 0) {
+            z = (z shl 1) xor ((z ushr 7) * 0x11D)
+            z = z xor (((y ushr i) and 1) * x)
         }
+        return z
     }
 
     private class BitBuffer {
         private val bytes = ByteArrayOutputStream()
         var bitLength = 0
             private set
-
-        val byteLength: Int
-            get() = (bitLength + 7) / 8
 
         private var currentByte = 0
         private var numBitsInCurrent = 0

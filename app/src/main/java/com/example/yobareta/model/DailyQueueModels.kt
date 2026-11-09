@@ -30,8 +30,7 @@ data class DailyPatientEntry(
         val cleanBase = baseUrl.trimEnd('/')
         val encodedName = java.net.URLEncoder.encode(name, "UTF-8")
         val encodedTicket = java.net.URLEncoder.encode(ticketNumber, "UTF-8")
-        val encodedDest = java.net.URLEncoder.encode(destination, "UTF-8")
-        return "$cleanBase/?ticket=$encodedTicket&name=$encodedName&dest=$encodedDest"
+        return "$cleanBase/?sid=$id&ticket=$encodedTicket&name=$encodedName"
     }
 }
 

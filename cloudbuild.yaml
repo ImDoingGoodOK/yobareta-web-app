@@ -1,0 +1,30 @@
+steps:
+  # Build the container image from the root Dockerfile
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/yobareta-web-app:$COMMIT_SHA', '.']
+
+  # Push the container image to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/yobareta-web-app:$COMMIT_SHA']
+
+  # Deploy container image to Cloud Run in asia-northeast1 (Tokyo)
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'yobareta-web-app'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/yobareta-web-app:$COMMIT_SHA'
+      - '--region'
+      - 'asia-northeast1'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--min-instances'
+      - '1'
+      - '--max-instances'
+      - '3'
+
+images:
+  - 'gcr.io/$PROJECT_ID/yobareta-web-app:$COMMIT_SHA'

@@ -8,17 +8,15 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
@@ -28,6 +26,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -49,15 +48,15 @@ import com.example.yobareta.ui.theme.YobaretaTheme
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.util.UUID
 
 /**
  * Nurse Station & Reception Desk Tablet Console for Yobareta.
  *
- * Designed for cheap Android tablets placed at reception desks or nurse stations:
+ * Designed for cheap Android tablets placed at reception desks, clinics, or counters:
+ * - "Add Customer" flow: input customer name -> auto-assigns temporary ID & sequential number -> displays QR code.
  * - Continuously listens via USB / built-in microphone for spoken announcements.
- * - Manages the daily waiting queue with automatic midnight reset.
- * - Generates scannable QR codes for each patient to launch their zero-install PWA.
- * - Displays live audio VU meter and push-alert delivery status.
+ * - Manages the daily waiting queue with automatic midnight/capacity reset.
  */
 class MainActivity : ComponentActivity() {
 
@@ -192,19 +191,30 @@ fun NurseDeskTabletScreen(
     onResetQueue: (Int) -> Unit,
     onSimulateCall: (String) -> Unit
 ) {
+    val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
-    val baseUrl = AppConfig.DEFAULT_CLOUD_RUN_BASE_URL
+    val discoveryClient = remember { YobaretaCloudClient() }
+    var baseUrl by remember { mutableStateOf(AppConfig.DEFAULT_CLOUD_RUN_BASE_URL) }
+
+    // Auto-discover public HTTPS Cloud URL (`https://...lhr.life`) from the host PC (`10.0.2.2:8080`)
+    LaunchedEffect(Unit) {
+        val discovered = discoveryClient.discoverHostServerUrl()
+        if (!discovered.isNullOrBlank()) {
+            AppConfig.updateServerBaseUrl(context, discovered)
+            baseUrl = AppConfig.DEFAULT_CLOUD_RUN_BASE_URL
+        }
+    }
 
     // Active modals
+    var showAddCustomerDialog by remember { mutableStateOf(false) }
     var activeQrPatient by remember { mutableStateOf<DailyPatientEntry?>(null) }
     var showCounterStandQr by remember { mutableStateOf(false) }
     var showResetConfirmDialog by remember { mutableStateOf(false) }
+    var showServerUrlDialog by remember { mutableStateOf(false) }
 
-    // Patient Form State
+    // Inline Quick Add Customer State
     var nameInput by remember { mutableStateOf("") }
-    var ticketInput by remember { mutableStateOf("") }
     var selectedDestination by remember { mutableStateOf("3番診察室 (Exam Room 3)") }
-    var customDestInput by remember { mutableStateOf("") }
     var proposedReadings by remember { mutableStateOf<List<ReadingOption>>(emptyList()) }
     var readingDebounceJob by remember { mutableStateOf<Job?>(null) }
 
@@ -225,7 +235,7 @@ fun NurseDeskTabletScreen(
         else -> queueList
     }
 
-    // Auto-update readings as nurse types patient name
+    // Auto-update readings as staff types customer name
     LaunchedEffect(nameInput) {
         val trimmed = nameInput.trim()
         if (trimmed.isEmpty()) {
@@ -234,7 +244,7 @@ fun NurseDeskTabletScreen(
         }
         readingDebounceJob?.cancel()
         readingDebounceJob = coroutineScope.launch {
-            delay(400)
+            delay(350)
             proposedReadings = KanjiReadingProposer.proposeReadings(trimmed)
         }
     }
@@ -247,13 +257,13 @@ fun NurseDeskTabletScreen(
                         Text("🏥", fontSize = 24.sp)
                         Column {
                             Text(
-                                "Yobareta Nurse Desk (受付・ナースステーション)",
+                                "Yobareta Console (受付・呼出システム)",
                                 fontWeight = FontWeight.Bold,
-                                fontSize = 18.sp
+                                fontSize = 17.sp
                             )
                             Text(
-                                "📅 $currentDate  |  待合: ${waitingCount}名 / 本日合計: ${queueList.size}名",
-                                fontSize = 12.sp,
+                                "📅 $currentDate  |  Waiting: $waitingCount / Total: ${queueList.size}  |  🌐 $baseUrl",
+                                fontSize = 11.sp,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
@@ -261,23 +271,38 @@ fun NurseDeskTabletScreen(
                 },
                 actions = {
                     Button(
-                        onClick = { showCounterStandQr = true },
-                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
-                        modifier = Modifier.padding(end = 8.dp)
+                        onClick = { showAddCustomerDialog = true },
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
+                        modifier = Modifier.padding(end = 6.dp)
                     ) {
-                        Text("📲 受付スタンドQR", color = MaterialTheme.colorScheme.onPrimaryContainer, fontSize = 13.sp)
+                        Text("➕ Add Customer", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    }
+                    OutlinedButton(
+                        onClick = { showServerUrlDialog = true },
+                        modifier = Modifier.padding(end = 6.dp)
+                    ) {
+                        Text("🌐 Server IP", fontSize = 12.sp)
                     }
                     OutlinedButton(
                         onClick = { showResetConfirmDialog = true },
                         modifier = Modifier.padding(end = 8.dp)
                     ) {
-                        Text("🔄 本日リセット", fontSize = 13.sp)
+                        Text("🔄 Reset", fontSize = 12.sp)
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.surface
                 )
             )
+        },
+        floatingActionButton = {
+            ExtendedFloatingActionButton(
+                onClick = { showAddCustomerDialog = true },
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary
+            ) {
+                Text("➕ Add Customer (新規QR発行)", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+            }
         }
     ) { innerPadding ->
         BoxWithConstraints(
@@ -296,13 +321,41 @@ fun NurseDeskTabletScreen(
                         .padding(16.dp),
                     horizontalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
-                    // Left Pane: Broadcaster & Check-in (42%)
+                    // Left Pane: Add Customer Card & Desk Mic (42%)
                     Column(
                         modifier = Modifier
                             .weight(0.42f)
                             .verticalScroll(rememberScrollState()),
                         verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
+                        QuickAddCustomerCard(
+                            nextTicketNumber = nextTicketNumber,
+                            nameInput = nameInput,
+                            onNameInputChange = { nameInput = it },
+                            selectedDestination = selectedDestination,
+                            onDestinationChange = { selectedDestination = it },
+                            proposedReadings = proposedReadings,
+                            onOpenModalClick = { showAddCustomerDialog = true },
+                            onRegisterCustomer = {
+                                val customerName = nameInput.trim().ifEmpty { "Customer #$nextTicketNumber" }
+                                val fullReads = KanjiReadingProposer.buildFullNameHints(customerName, proposedReadings)
+                                val surReads = KanjiReadingProposer.buildSurnameHints(customerName, proposedReadings)
+                                val givReads = KanjiReadingProposer.buildGivenNameHints(customerName, proposedReadings)
+
+                                val created = onAddPatient(
+                                    customerName,
+                                    nextTicketNumber.toString(),
+                                    selectedDestination,
+                                    fullReads,
+                                    surReads,
+                                    givReads
+                                )
+                                // Immediately display the QR code for this newly added customer
+                                activeQrPatient = created
+                                nameInput = ""
+                            }
+                        )
+
                         DeskMicBroadcasterCard(
                             isMicGranted = isMicGranted,
                             serviceState = serviceState,
@@ -311,38 +364,6 @@ fun NurseDeskTabletScreen(
                             simCallInput = simCallInput,
                             onSimCallInputChange = { simCallInput = it },
                             onSimulateCall = onSimulateCall
-                        )
-
-                        NewPatientCheckinCard(
-                            nextTicketNumber = nextTicketNumber,
-                            nameInput = nameInput,
-                            onNameInputChange = { nameInput = it },
-                            ticketInput = ticketInput,
-                            onTicketInputChange = { ticketInput = it },
-                            selectedDestination = selectedDestination,
-                            onDestinationChange = { selectedDestination = it },
-                            customDestInput = customDestInput,
-                            onCustomDestInputChange = { customDestInput = it },
-                            proposedReadings = proposedReadings,
-                            onRegisterPatient = {
-                                val fullReads = KanjiReadingProposer.buildFullNameHints(nameInput, proposedReadings)
-                                val surReads = KanjiReadingProposer.buildSurnameHints(nameInput, proposedReadings)
-                                val givReads = KanjiReadingProposer.buildGivenNameHints(nameInput, proposedReadings)
-                                val finalDest = if (selectedDestination == "Custom") customDestInput else selectedDestination
-
-                                val created = onAddPatient(
-                                    nameInput,
-                                    ticketInput.ifEmpty { nextTicketNumber.toString() },
-                                    finalDest,
-                                    fullReads,
-                                    surReads,
-                                    givReads
-                                )
-                                // Auto-show the QR code modal for this newly registered patient!
-                                activeQrPatient = created
-                                nameInput = ""
-                                ticketInput = ""
-                            }
                         )
                     }
 
@@ -360,9 +381,10 @@ fun NurseDeskTabletScreen(
                             calledCount = calledCount,
                             completedCount = completedCount,
                             patients = filteredList,
+                            onAddCustomerClick = { showAddCustomerDialog = true },
                             onShowQr = { activeQrPatient = it },
                             onCallPatient = { p ->
-                                onSimulateCall("${p.name}様、${p.destination}へお入りください")
+                                onSimulateCall("${p.ticketNumber}番 ${p.name}様、${p.destination}へお入りください")
                             },
                             onMarkCompleted = onMarkCompleted,
                             onRemovePatient = onRemovePatient
@@ -370,7 +392,7 @@ fun NurseDeskTabletScreen(
                     }
                 }
             } else {
-                // Single-column smartphone / small portrait tablet fallback
+                // Single-column smartphone / portrait layout
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
@@ -378,44 +400,30 @@ fun NurseDeskTabletScreen(
                         .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
-                    DeskMicBroadcasterCard(
-                        isMicGranted = isMicGranted,
-                        serviceState = serviceState,
-                        onRequestPermissions = onRequestPermissions,
-                        onToggleListening = onToggleListening,
-                        simCallInput = simCallInput,
-                        onSimCallInputChange = { simCallInput = it },
-                        onSimulateCall = onSimulateCall
-                    )
-
-                    NewPatientCheckinCard(
+                    QuickAddCustomerCard(
                         nextTicketNumber = nextTicketNumber,
                         nameInput = nameInput,
                         onNameInputChange = { nameInput = it },
-                        ticketInput = ticketInput,
-                        onTicketInputChange = { ticketInput = it },
                         selectedDestination = selectedDestination,
                         onDestinationChange = { selectedDestination = it },
-                        customDestInput = customDestInput,
-                        onCustomDestInputChange = { customDestInput = it },
                         proposedReadings = proposedReadings,
-                        onRegisterPatient = {
-                            val fullReads = KanjiReadingProposer.buildFullNameHints(nameInput, proposedReadings)
-                            val surReads = KanjiReadingProposer.buildSurnameHints(nameInput, proposedReadings)
-                            val givReads = KanjiReadingProposer.buildGivenNameHints(nameInput, proposedReadings)
-                            val finalDest = if (selectedDestination == "Custom") customDestInput else selectedDestination
+                        onOpenModalClick = { showAddCustomerDialog = true },
+                        onRegisterCustomer = {
+                            val customerName = nameInput.trim().ifEmpty { "Customer #$nextTicketNumber" }
+                            val fullReads = KanjiReadingProposer.buildFullNameHints(customerName, proposedReadings)
+                            val surReads = KanjiReadingProposer.buildSurnameHints(customerName, proposedReadings)
+                            val givReads = KanjiReadingProposer.buildGivenNameHints(customerName, proposedReadings)
 
                             val created = onAddPatient(
-                                nameInput,
-                                ticketInput.ifEmpty { nextTicketNumber.toString() },
-                                finalDest,
+                                customerName,
+                                nextTicketNumber.toString(),
+                                selectedDestination,
                                 fullReads,
                                 surReads,
                                 givReads
                             )
                             activeQrPatient = created
                             nameInput = ""
-                            ticketInput = ""
                         }
                     )
 
@@ -427,24 +435,71 @@ fun NurseDeskTabletScreen(
                         calledCount = calledCount,
                         completedCount = completedCount,
                         patients = filteredList,
+                        onAddCustomerClick = { showAddCustomerDialog = true },
                         onShowQr = { activeQrPatient = it },
                         onCallPatient = { p ->
-                            onSimulateCall("${p.name}様、${p.destination}へお入りください")
+                            onSimulateCall("${p.ticketNumber}番 ${p.name}様、${p.destination}へお入りください")
                         },
                         onMarkCompleted = onMarkCompleted,
                         onRemovePatient = onRemovePatient,
-                        modifier = Modifier.height(480.dp)
+                        modifier = Modifier.height(440.dp)
                     )
+
+                    DeskMicBroadcasterCard(
+                        isMicGranted = isMicGranted,
+                        serviceState = serviceState,
+                        onRequestPermissions = onRequestPermissions,
+                        onToggleListening = onToggleListening,
+                        simCallInput = simCallInput,
+                        onSimCallInputChange = { simCallInput = it },
+                        onSimulateCall = onSimulateCall
+                    )
+
+                    Spacer(modifier = Modifier.height(72.dp))
                 }
             }
         }
     }
 
-    // Modal 1: Individual Patient QR Code Dialog
+    // Modal 0: "Add Customer" Input Dialog -> Auto-assigns Temp ID & Number -> Opens QR Code
+    if (showAddCustomerDialog) {
+        AddCustomerDialog(
+            nextTicketNumber = nextTicketNumber,
+            onDismiss = { showAddCustomerDialog = false },
+            onCustomerAdded = { customerName, destination, fullR, surR, givR ->
+                val created = onAddPatient(
+                    customerName,
+                    nextTicketNumber.toString(),
+                    destination,
+                    fullR,
+                    surR,
+                    givR
+                )
+                showAddCustomerDialog = false
+                // Immediately show the QR code modal for this customer!
+                activeQrPatient = created
+            }
+        )
+    }
+
+    // Modal 1: Individual Customer QR Code Dialog
+    LaunchedEffect(activeQrPatient) {
+        if (activeQrPatient != null) {
+            val discovered = discoveryClient.discoverHostServerUrl()
+            if (!discovered.isNullOrBlank()) {
+                AppConfig.updateServerBaseUrl(context, discovered)
+                baseUrl = AppConfig.DEFAULT_CLOUD_RUN_BASE_URL
+            }
+        }
+    }
+
     activeQrPatient?.let { patient ->
         PatientQrCodeDialog(
             patient = patient,
             baseUrl = baseUrl,
+            onCallNow = {
+                onSimulateCall("${patient.ticketNumber}番 ${patient.name}様、${patient.destination}へお入りください")
+            },
             onDismiss = { activeQrPatient = null }
         )
     }
@@ -457,12 +512,66 @@ fun NurseDeskTabletScreen(
         )
     }
 
-    // Modal 3: Daily Reset Confirmation Dialog
+    // Modal 3: Server URL Settings Dialog
+    if (showServerUrlDialog) {
+        var urlDraft by remember(baseUrl) { mutableStateOf(baseUrl) }
+        AlertDialog(
+            onDismissRequest = { showServerUrlDialog = false },
+            title = { Text("🌐 Cloud / Server URL Settings") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Enter your Cloud Run / Render / Public Tunnel HTTPS URL (or local Wi-Fi IP) so your phone opens the website when scanning the QR code:",
+                        fontSize = 13.sp
+                    )
+                    OutlinedTextField(
+                        value = urlDraft,
+                        onValueChange = { urlDraft = it },
+                        label = { Text("Server Base URL") },
+                        placeholder = { Text("https://your-service.run.app") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedButton(
+                        onClick = {
+                            coroutineScope.launch {
+                                val discovered = discoveryClient.discoverHostServerUrl()
+                                if (!discovered.isNullOrBlank()) {
+                                    urlDraft = discovered
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("🔄 Auto-Detect Public Cloud Tunnel URL")
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        AppConfig.updateServerBaseUrl(context, urlDraft)
+                        baseUrl = AppConfig.DEFAULT_CLOUD_RUN_BASE_URL
+                        showServerUrlDialog = false
+                    }
+                ) {
+                    Text("Save URL")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showServerUrlDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    // Modal 4: Daily Reset Confirmation Dialog
     if (showResetConfirmDialog) {
         AlertDialog(
             onDismissRequest = { showResetConfirmDialog = false },
-            title = { Text("本日の順番待ちをリセットしますか？") },
-            text = { Text("本日の登録患者リストをクリアし、受付番号を #101 から再開します。") },
+            title = { Text("Reset Today's Customer Queue?") },
+            text = { Text("This clears today's customer list and restarts numbering from #101.") },
             confirmButton = {
                 Button(
                     onClick = {
@@ -471,15 +580,325 @@ fun NurseDeskTabletScreen(
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
                 ) {
-                    Text("リセット実行", color = MaterialTheme.colorScheme.onError)
+                    Text("Reset Queue", color = MaterialTheme.colorScheme.onError)
                 }
             },
             dismissButton = {
                 TextButton(onClick = { showResetConfirmDialog = false }) {
-                    Text("キャンセル")
+                    Text("Cancel")
                 }
             }
         )
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Component: Add Customer Modal Dialog (Input Name -> Assign Temp ID -> Show QR)
+// -----------------------------------------------------------------------------
+
+@Composable
+fun AddCustomerDialog(
+    nextTicketNumber: Int,
+    onDismiss: () -> Unit,
+    onCustomerAdded: (
+        name: String,
+        destination: String,
+        fullReadings: List<String>,
+        surnameReadings: List<String>,
+        givenReadings: List<String>
+    ) -> Unit
+) {
+    val coroutineScope = rememberCoroutineScope()
+    var customerName by remember { mutableStateOf("") }
+    var selectedDest by remember { mutableStateOf("3番診察室 (Exam Room 3)") }
+    var proposedReadings by remember { mutableStateOf<List<ReadingOption>>(emptyList()) }
+    var debounceJob by remember { mutableStateOf<Job?>(null) }
+    val previewTempId = remember { UUID.randomUUID().toString().take(8).uppercase() }
+
+    val destinations = listOf(
+        "3番診察室 (Exam Room 3)",
+        "1番窓口 (Counter 1)",
+        "2番窓口 (Counter 2)",
+        "受取カウンター (Pickup)",
+        "1番診察室 (Room 1)"
+    )
+
+    LaunchedEffect(customerName) {
+        val trimmed = customerName.trim()
+        if (trimmed.isEmpty()) {
+            proposedReadings = emptyList()
+            return@LaunchedEffect
+        }
+        debounceJob?.cancel()
+        debounceJob = coroutineScope.launch {
+            delay(300)
+            proposedReadings = KanjiReadingProposer.proposeReadings(trimmed)
+        }
+    }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            shape = RoundedCornerShape(18.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(8.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .padding(24.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Text(
+                    "➕ Add New Customer (新規顧客・患者登録)",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 19.sp
+                )
+
+                // Auto-assigned temporary number & ID preview banner
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column {
+                            Text(
+                                "Auto-Assigned Number (自動発番)",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer
+                            )
+                            Text(
+                                "#$nextTicketNumber",
+                                fontWeight = FontWeight.ExtraBold,
+                                fontSize = 24.sp,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = MaterialTheme.colorScheme.surface
+                        ) {
+                            Text(
+                                "Temp ID: $previewTempId",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                            )
+                        }
+                    }
+                }
+
+                // Customer Name Input
+                OutlinedTextField(
+                    value = customerName,
+                    onValueChange = { customerName = it },
+                    label = { Text("Customer Name / お名前") },
+                    placeholder = { Text("e.g. Alex Smith / 東海林 太郎") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                // Phonetic reading preview if applicable
+                if (proposedReadings.isNotEmpty()) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            "Voice Recognition Readings (音声認識よみがな):",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            proposedReadings.forEach { opt ->
+                                AssistChip(
+                                    onClick = {},
+                                    label = { Text(opt.fullReading, fontSize = 11.sp) }
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Destination selector
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        "Destination / 呼び出し先:",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        destinations.forEach { dest ->
+                            FilterChip(
+                                selected = selectedDest == dest,
+                                onClick = { selectedDest = dest },
+                                label = { Text(dest, fontSize = 11.sp) }
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
+
+                // Action Buttons
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.weight(0.38f)
+                    ) {
+                        Text("Cancel")
+                    }
+                    Button(
+                        onClick = {
+                            val finalName = customerName.trim().ifEmpty { "Customer #$nextTicketNumber" }
+                            val fullR = KanjiReadingProposer.buildFullNameHints(finalName, proposedReadings)
+                            val surR = KanjiReadingProposer.buildSurnameHints(finalName, proposedReadings)
+                            val givR = KanjiReadingProposer.buildGivenNameHints(finalName, proposedReadings)
+                            onCustomerAdded(finalName, selectedDest, fullR, surR, givR)
+                        },
+                        enabled = customerName.isNotBlank(),
+                        modifier = Modifier.weight(0.62f)
+                    ) {
+                        Text("Assign & Show QR 📲", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Component: Inline Add Customer Card
+// -----------------------------------------------------------------------------
+
+@Composable
+fun QuickAddCustomerCard(
+    nextTicketNumber: Int,
+    nameInput: String,
+    onNameInputChange: (String) -> Unit,
+    selectedDestination: String,
+    onDestinationChange: (String) -> Unit,
+    proposedReadings: List<ReadingOption>,
+    onOpenModalClick: () -> Unit,
+    onRegisterCustomer: () -> Unit
+) {
+    val commonDests = listOf(
+        "3番診察室 (Exam Room 3)",
+        "1番窓口 (Counter 1)",
+        "2番窓口 (Counter 2)",
+        "受取カウンター (Pickup)",
+        "会計窓口 (Cashier)"
+    )
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text(
+                        "➕ Add Customer (新規顧客・受付)",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 16.sp
+                    )
+                    Text(
+                        "Next Auto-Assigned Number: #$nextTicketNumber",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+                OutlinedButton(onClick = onOpenModalClick) {
+                    Text("Popup Form", fontSize = 11.sp)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            OutlinedTextField(
+                value = nameInput,
+                onValueChange = onNameInputChange,
+                label = { Text("Customer Name / お名前を入力") },
+                placeholder = { Text("e.g. Alex Smith / 東海林 太郎") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true
+            )
+
+            // Proposed Reading Chips
+            if (proposedReadings.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text("Phonetic Readings (音声認識用):", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    proposedReadings.forEach { opt ->
+                        AssistChip(
+                            onClick = {},
+                            label = { Text("${opt.fullReading} (${opt.surnameReading})", fontSize = 11.sp) }
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+            Text("Destination / 案内先:", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(modifier = Modifier.height(6.dp))
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                commonDests.forEach { dest ->
+                    FilterChip(
+                        selected = selectedDestination == dest,
+                        onClick = { onDestinationChange(dest) },
+                        label = { Text(dest, fontSize = 11.sp) }
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            Button(
+                onClick = onRegisterCustomer,
+                enabled = nameInput.isNotBlank(),
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(10.dp)
+            ) {
+                Text(
+                    "➕ Add Customer (#$nextTicketNumber) & Generate QR 📲",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 14.sp
+                )
+            }
+        }
     }
 }
 
@@ -509,12 +928,12 @@ fun DeskMicBroadcasterCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    "🎙️ 受付・呼出マイク (Desk Mic)",
+                    "🎙️ Desk Microphone (呼出マイク)",
                     fontWeight = FontWeight.Bold,
                     fontSize = 16.sp
                 )
                 val badgeColor = if (serviceState.isListening) Color(0xFF16A34A) else Color(0xFF64748B)
-                val badgeText = if (serviceState.isListening) "稼働中 (Listening)" else "停止中 (Idle)"
+                val badgeText = if (serviceState.isListening) "Listening" else "Idle"
                 Surface(
                     shape = RoundedCornerShape(20.dp),
                     color = badgeColor.copy(alpha = 0.15f)
@@ -537,7 +956,7 @@ fun DeskMicBroadcasterCard(
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("マイク権限を許可してください")
+                    Text("Grant Microphone Permission")
                 }
             } else {
                 Button(
@@ -548,7 +967,7 @@ fun DeskMicBroadcasterCard(
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text(
-                        if (serviceState.isListening) "マイクを停止する" else "受付マイクを開始する (常時集音)",
+                        if (serviceState.isListening) "Stop Desk Mic" else "Start Desk Mic (常時集音開始)",
                         fontWeight = FontWeight.Bold
                     )
                 }
@@ -561,7 +980,7 @@ fun DeskMicBroadcasterCard(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Text("音量レベル (VAD)", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Audio Level (VAD)", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text(
                     "${serviceState.currentDbFs.toInt()} dBFS",
                     fontSize = 11.sp,
@@ -591,7 +1010,7 @@ fun DeskMicBroadcasterCard(
                 ) {
                     Column(modifier = Modifier.padding(10.dp)) {
                         Text(
-                            "📢 最新認識: \"${serviceState.latestTranscript}\"",
+                            "📢 Recognized: \"${serviceState.latestTranscript}\"",
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Bold
                         )
@@ -611,7 +1030,7 @@ fun DeskMicBroadcasterCard(
             Spacer(modifier = Modifier.height(14.dp))
             HorizontalDivider()
             Spacer(modifier = Modifier.height(10.dp))
-            Text("手動呼出テスト (音声なしでプッシュ通知)", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            Text("Manual Call Trigger (テキストで呼び出し通知)", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
             Spacer(modifier = Modifier.height(6.dp))
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
@@ -625,110 +1044,8 @@ fun DeskMicBroadcasterCard(
                     onClick = { onSimulateCall(simCallInput) },
                     shape = RoundedCornerShape(8.dp)
                 ) {
-                    Text("呼出", fontSize = 12.sp)
+                    Text("Call 📣", fontSize = 12.sp)
                 }
-            }
-        }
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Component: New Patient Check-in Card (Reception Desk)
-// -----------------------------------------------------------------------------
-
-@Composable
-fun NewPatientCheckinCard(
-    nextTicketNumber: Int,
-    nameInput: String,
-    onNameInputChange: (String) -> Unit,
-    ticketInput: String,
-    onTicketInputChange: (String) -> Unit,
-    selectedDestination: String,
-    onDestinationChange: (String) -> Unit,
-    customDestInput: String,
-    onCustomDestInputChange: (String) -> Unit,
-    proposedReadings: List<ReadingOption>,
-    onRegisterPatient: () -> Unit
-) {
-    val commonDests = listOf("3番診察室 (Exam Room 3)", "1番診察室", "2番診察室", "2番窓口", "会計窓口", "お薬窓口")
-
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(14.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text("📝 新規患者受付 (Check-in)", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-            Spacer(modifier = Modifier.height(12.dp))
-
-            // Ticket & Name Row
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedTextField(
-                    value = ticketInput,
-                    onValueChange = onTicketInputChange,
-                    label = { Text("番号 (#$nextTicketNumber)") },
-                    placeholder = { Text("#$nextTicketNumber") },
-                    modifier = Modifier.weight(0.35f),
-                    singleLine = true
-                )
-
-                OutlinedTextField(
-                    value = nameInput,
-                    onValueChange = onNameInputChange,
-                    label = { Text("お名前 (漢字・英語)") },
-                    placeholder = { Text("例: 東海林 太郎") },
-                    modifier = Modifier.weight(0.65f),
-                    singleLine = true
-                )
-            }
-
-            // Proposed Reading Chips
-            if (proposedReadings.isNotEmpty()) {
-                Spacer(modifier = Modifier.height(8.dp))
-                Text("よみがな候補 (音声認識用):", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    proposedReadings.forEach { opt ->
-                        AssistChip(
-                            onClick = {},
-                            label = { Text("${opt.fullReading} (${opt.surnameReading})", fontSize = 11.sp) }
-                        )
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(12.dp))
-            Text("行先 (Destination):", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-            Spacer(modifier = Modifier.height(6.dp))
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                commonDests.forEach { dest ->
-                    FilterChip(
-                        selected = selectedDestination == dest,
-                        onClick = { onDestinationChange(dest) },
-                        label = { Text(dest.take(10), fontSize = 11.sp) }
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.height(14.dp))
-
-            Button(
-                onClick = onRegisterPatient,
-                enabled = nameInput.isNotBlank() || ticketInput.isNotBlank(),
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(10.dp)
-            ) {
-                Text("受付登録 ＆ QRコード表示 📲", fontWeight = FontWeight.Bold, fontSize = 15.sp)
             }
         }
     }
@@ -747,6 +1064,7 @@ fun TodayQueueCard(
     calledCount: Int,
     completedCount: Int,
     patients: List<DailyPatientEntry>,
+    onAddCustomerClick: () -> Unit,
     onShowQr: (DailyPatientEntry) -> Unit,
     onCallPatient: (DailyPatientEntry) -> Unit,
     onMarkCompleted: (String) -> Unit,
@@ -759,15 +1077,24 @@ fun TodayQueueCard(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
         Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-            Text("📋 本日の待合リスト (Daily Queue)", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("📋 Today's Customer Queue (本日の待合リスト)", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                Button(onClick = onAddCustomerClick) {
+                    Text("➕ Add Customer", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+            }
             Spacer(modifier = Modifier.height(10.dp))
 
             // Tabs
             TabRow(selectedTabIndex = selectedTab) {
-                Tab(selected = selectedTab == 0, onClick = { onSelectTab(0) }, text = { Text("すべて ($totalCount)") })
-                Tab(selected = selectedTab == 1, onClick = { onSelectTab(1) }, text = { Text("待合中 ($waitingCount)") })
-                Tab(selected = selectedTab == 2, onClick = { onSelectTab(2) }, text = { Text("呼出中 ($calledCount)") })
-                Tab(selected = selectedTab == 3, onClick = { onSelectTab(3) }, text = { Text("完了 ($completedCount)") })
+                Tab(selected = selectedTab == 0, onClick = { onSelectTab(0) }, text = { Text("All ($totalCount)") })
+                Tab(selected = selectedTab == 1, onClick = { onSelectTab(1) }, text = { Text("Waiting ($waitingCount)") })
+                Tab(selected = selectedTab == 2, onClick = { onSelectTab(2) }, text = { Text("Called ($calledCount)") })
+                Tab(selected = selectedTab == 3, onClick = { onSelectTab(3) }, text = { Text("Done ($completedCount)") })
             }
 
             Spacer(modifier = Modifier.height(10.dp))
@@ -779,12 +1106,17 @@ fun TodayQueueCard(
                         .padding(32.dp),
                     contentAlignment = Alignment.Center
                 ) {
-                    Text(
-                        "登録された患者様はいません。\n左側のフォームから受付登録を行ってください。",
-                        textAlign = TextAlign.Center,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        fontSize = 14.sp
-                    )
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text(
+                            "No customers in queue yet.\nTap '➕ Add Customer' to enter a name, assign a temporary ID/number, and show their QR code.",
+                            textAlign = TextAlign.Center,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontSize = 14.sp
+                        )
+                        Button(onClick = onAddCustomerClick) {
+                            Text("➕ Add First Customer")
+                        }
+                    }
                 }
             } else {
                 LazyColumn(
@@ -834,7 +1166,7 @@ fun PatientQueueRow(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            // Left info: Ticket, Name, Dest
+            // Left info: Ticket, Name, Temp ID, Dest
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -857,20 +1189,27 @@ fun PatientQueueRow(
                 }
 
                 Column {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            patient.name,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 15.sp
+                        )
+                        Text(
+                            "(ID: ${patient.id})",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                     Text(
-                        patient.name,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 15.sp
-                    )
-                    Text(
-                        "📍 ${patient.destination}  •  ${patient.waitMinutes}分前",
+                        "📍 ${patient.destination}  •  ${patient.waitMinutes}m ago",
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
 
-            // Right actions: Status + Buttons
+            // Right actions: Status + QR + Call + Done
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 Surface(
                     shape = RoundedCornerShape(12.dp),
@@ -885,16 +1224,27 @@ fun PatientQueueRow(
                     )
                 }
 
-                IconButton(onClick = onShowQr, modifier = Modifier.size(36.dp)) {
-                    Text("📱", fontSize = 18.sp)
+                OutlinedButton(
+                    onClick = onShowQr,
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                    modifier = Modifier.height(34.dp)
+                ) {
+                    Text("📱 QR", fontSize = 12.sp)
                 }
-                IconButton(onClick = onCall, modifier = Modifier.size(36.dp)) {
-                    Text("📣", fontSize = 18.sp)
+                Button(
+                    onClick = onCall,
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                    modifier = Modifier.height(34.dp)
+                ) {
+                    Text("📣 Call", fontSize = 12.sp)
                 }
                 if (patient.status != PatientQueueStatus.COMPLETED) {
-                    IconButton(onClick = onDone, modifier = Modifier.size(36.dp)) {
-                        Text("✅", fontSize = 18.sp)
+                    IconButton(onClick = onDone, modifier = Modifier.size(32.dp)) {
+                        Text("✅", fontSize = 16.sp)
                     }
+                }
+                IconButton(onClick = onDelete, modifier = Modifier.size(32.dp)) {
+                    Text("🗑️", fontSize = 15.sp)
                 }
             }
         }
@@ -902,37 +1252,57 @@ fun PatientQueueRow(
 }
 
 // -----------------------------------------------------------------------------
-// Component: Modals (Patient QR Code & Countertop Stand QR)
+// Component: Modals (Customer QR Code & Countertop Stand QR)
 // -----------------------------------------------------------------------------
 
 @Composable
 fun PatientQrCodeDialog(
     patient: DailyPatientEntry,
     baseUrl: String,
+    onCallNow: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val pwaUrl = patient.toPwaUrl(baseUrl)
     val qrBitmap = remember(pwaUrl) {
         QrCodeBitmapGenerator.encodeToBitmap(pwaUrl, sizePx = 512)
     }
+    var callTriggered by remember { mutableStateOf(false) }
 
     Dialog(onDismissRequest = onDismiss) {
         Card(
-            shape = RoundedCornerShape(16.dp),
+            shape = RoundedCornerShape(18.dp),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            modifier = Modifier.padding(16.dp)
+            modifier = Modifier.padding(12.dp)
         ) {
             Column(
-                modifier = Modifier.padding(24.dp),
-                horizontalAlignment = Alignment.CenterAlignment
+                modifier = Modifier
+                    .padding(24.dp)
+                    .verticalScroll(rememberScrollState()),
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
+                Surface(
+                    shape = RoundedCornerShape(20.dp),
+                    color = MaterialTheme.colorScheme.primaryContainer
+                ) {
+                    Text(
+                        "Assigned Number: #${patient.ticketNumber}  |  Temp ID: ${patient.id}",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
                 Text(
-                    "#${patient.ticketNumber}  ${patient.name}",
-                    fontSize = 20.sp,
-                    fontWeight = FontWeight.Bold
+                    patient.name,
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    textAlign = TextAlign.Center
                 )
                 Text(
-                    "行先: ${patient.destination}",
+                    "Destination: ${patient.destination}",
                     fontSize = 13.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -941,17 +1311,26 @@ fun PatientQrCodeDialog(
 
                 Image(
                     bitmap = qrBitmap.asImageBitmap(),
-                    contentDescription = "Patient QR Code",
+                    contentDescription = "Customer QR Code",
                     modifier = Modifier
-                        .size(220.dp)
+                        .size(230.dp)
                         .clip(RoundedCornerShape(10.dp))
-                        .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(10.dp))
+                        .border(2.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.4f), RoundedCornerShape(10.dp))
                 )
 
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(10.dp))
 
                 Text(
-                    "院外（カフェ・お車等）でお待ちの方はこちらをお手元のスマホでスキャンしてください。\n呼び出し時にスマホが振動・通知します。",
+                    pwaUrl,
+                    textAlign = TextAlign.Center,
+                    fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.primary
+                )
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Text(
+                    "Scan this QR code with your phone camera.\nYour phone will open your personal waiting page and vibrate/chime when #${patient.ticketNumber} is called.",
                     textAlign = TextAlign.Center,
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -960,11 +1339,30 @@ fun PatientQrCodeDialog(
 
                 Spacer(modifier = Modifier.height(16.dp))
 
+                // Quick Call Button right inside the QR modal for instant testing!
                 Button(
+                    onClick = {
+                        onCallNow()
+                        callTriggered = true
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (callTriggered) Color(0xFF16A34A) else MaterialTheme.colorScheme.secondary
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        if (callTriggered) "✅ Call Sent to Phone! (Tap to Recall 📣)" else "📣 Test Call This Customer Now",
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                OutlinedButton(
                     onClick = onDismiss,
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("閉じる")
+                    Text("Done / Close (閉じる)")
                 }
             }
         }
@@ -989,16 +1387,16 @@ fun CounterStandQrDialog(
         ) {
             Column(
                 modifier = Modifier.padding(28.dp),
-                horizontalAlignment = Alignment.CenterAlignment
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text(
-                    "院外でお待ちいただけます 🌿",
+                    "Wait Anywhere 🌿 (院外待機QR)",
                     fontSize = 20.sp,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary
                 )
                 Text(
-                    "カフェ・屋外ガーデン・お車などで待機可能",
+                    "Scan to open the Yobareta web app",
                     fontSize = 13.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -1014,14 +1412,13 @@ fun CounterStandQrDialog(
                         .border(2.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
                 )
 
-                Spacer(modifier = Modifier.height(18.dp))
+                Spacer(modifier = Modifier.height(10.dp))
 
                 Text(
-                    "スマートフォンで上記QRコードを読み取り、\n受付番号またはお名前をご入力ください。\n順番になるとスマホが強く振動してご案内します。",
+                    standUrl,
                     textAlign = TextAlign.Center,
-                    fontSize = 13.sp,
-                    lineHeight = 18.sp,
-                    fontWeight = FontWeight.Medium
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.primary
                 )
 
                 Spacer(modifier = Modifier.height(20.dp))
@@ -1030,7 +1427,7 @@ fun CounterStandQrDialog(
                     onClick = onDismiss,
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("受付画面に戻る")
+                    Text("Close")
                 }
             }
         }

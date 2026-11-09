@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Tuple
 import uuid
 
 from fastapi import WebSocket
-from matcher import MatchResult, derive_given_name_readings, evaluate_transcript, normalize_reading_morae
+from matcher import MatchResult, derive_given_name_readings, evaluate_transcript
 
 logger = logging.getLogger("yobareta.hub")
 
@@ -32,9 +32,11 @@ class PatientSession:
     status: str = "waiting"  # "waiting" | "called" | "recall" | "dismissed"
     checkin_time: float = field(default_factory=time.time)
     last_called_time: Optional[float] = None
+    call_count: int = 0
     destination: str = ""
     instruction: str = ""
     matched_trigger: str = ""
+    latest_alert: Optional[dict] = None
     websocket: Optional[WebSocket] = None
 
     def to_summary(self) -> dict:
@@ -45,6 +47,8 @@ class PatientSession:
             "status": self.status,
             "destination": self.destination,
             "instruction": self.instruction,
+            "call_count": self.call_count,
+            "latest_alert": self.latest_alert,
             "checkin_time": int(self.checkin_time),
             "last_called_time": int(self.last_called_time) if self.last_called_time else None,
             "wait_minutes": max(0, int((time.time() - self.checkin_time) / 60)),
@@ -68,14 +72,32 @@ class PatientQueueHub:
         given_name_readings: Optional[List[str]] = None,
         venue_mode: str = "auto",
         session_id: Optional[str] = None,
+        destination: str = "",
     ) -> PatientSession:
         async with self._lock:
-            sid = session_id or str(uuid.uuid4())[:8]
+            sid = (session_id or "").strip() or str(uuid.uuid4())[:8]
+
+            # If already registered by the nurse tablet, preserve existing readings & call status
+            existing = self._patients.get(sid)
+            if existing:
+                if name.strip():
+                    existing.name = name.strip()
+                if ticket_number.strip():
+                    existing.ticket_number = ticket_number.strip()
+                if destination.strip():
+                    existing.destination = destination.strip()
+                if full_name_readings:
+                    existing.full_name_readings = list(full_name_readings)
+                if surname_readings:
+                    existing.surname_readings = list(surname_readings)
+                if given_name_readings:
+                    existing.given_name_readings = list(given_name_readings)
+                return existing
+
             full_reads = list(full_name_readings or [])
             sur_reads = list(surname_readings or [])
             giv_reads = list(given_name_readings or [])
 
-            # Automatically derive readings if not passed
             if not full_reads and name:
                 full_reads.append(name.strip())
             if not giv_reads and full_reads and sur_reads:
@@ -89,6 +111,7 @@ class PatientQueueHub:
                 surname_readings=sur_reads,
                 given_name_readings=giv_reads,
                 venue_mode=venue_mode,
+                destination=destination.strip(),
             )
             self._patients[sid] = session
             logger.info("Patient registered in queue: session=%s (ticket=%s)", sid, ticket_number)
@@ -112,7 +135,6 @@ class PatientQueueHub:
 
     async def get_active_queue(self) -> List[dict]:
         now = time.time()
-        # Clean expired
         expired = [sid for sid, p in self._patients.items() if now - p.checkin_time > self.session_ttl_seconds]
         for sid in expired:
             self._patients.pop(sid, None)
@@ -143,8 +165,6 @@ class PatientQueueHub:
             return []
 
         matched_patients: List[Tuple[PatientSession, MatchResult]] = []
-
-        # Make copy of patients to evaluate without holding lock
         active_list = [p for p in self._patients.values() if p.status in ("waiting", "called", "recall")]
 
         for patient in active_list:
@@ -171,24 +191,29 @@ class PatientQueueHub:
         patient: PatientSession,
         match: MatchResult,
     ) -> None:
-        """Updates patient state and delivers alert payload over WebSocket."""
+        """Updates patient state and delivers alert payload over WebSocket and polling."""
         async with self._lock:
             patient.status = match.tier
             patient.last_called_time = time.time()
-            patient.destination = match.destination
-            patient.instruction = match.instruction_plain
+            patient.call_count += 1
+            dest = match.destination or patient.destination or "診察室 (Exam Room)"
+            patient.destination = dest
+            instr = match.instruction_plain or f"You were called → {dest}"
+            patient.instruction = instr
             patient.matched_trigger = match.matched_trigger
 
-        alert_payload = {
-            "type": "alert",
-            "tier": match.tier,
-            "score": match.score,
-            "matched_trigger": match.matched_trigger,
-            "destination": match.destination,
-            "instruction_plain": match.instruction_plain,
-            "transcript_masked": match.transcript_masked,
-            "timestamp": int(time.time()),
-        }
+            alert_payload = {
+                "type": "alert",
+                "tier": match.tier,
+                "score": match.score,
+                "matched_trigger": match.matched_trigger,
+                "destination": dest,
+                "instruction_plain": instr,
+                "transcript_masked": match.transcript_masked,
+                "call_count": patient.call_count,
+                "timestamp": int(time.time()),
+            }
+            patient.latest_alert = alert_payload
 
         if patient.websocket:
             try:

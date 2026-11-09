@@ -8,8 +8,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     STT_MODEL=chirp_3 \
     GEMINI_LOCATION=asia-northeast1 \
     GEMINI_MODEL=gemini-2.5-flash \
-    REQUIRE_AUTH=true \
-    REQUIRE_APP_CHECK=true
+    REQUIRE_AUTH=false \
+    REQUIRE_APP_CHECK=false
 
 WORKDIR /app
 
@@ -32,4 +32,4 @@ USER appuser
 
 EXPOSE 8080
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1"]
